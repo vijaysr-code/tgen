@@ -27,6 +27,10 @@ python client.py --port PORT [options]
 | `--duration` | `0.0` | Seconds to hold each connection open (0 = short-lived) |
 | `--payload` | `PING` | Payload string to send |
 | `--payload-size` | — | Random payload size in bytes (overrides `--payload`) |
+| `--pps` | `0.0` | Packets per second to send within each connection (requires `--duration > 0`) |
+| `--output` | — | Optional file path to log the output results |
+
+> **Note**: TCP keepalive is enabled by default for all TCP connections with a 10s idle time and 10s interval.
 
 ### Examples
 
@@ -36,6 +40,9 @@ python client.py --port 9000 --rate 5 --total 10
 
 # Long-lived UDP connections (2s each) at 2/sec, infinite
 python client.py --port 9001 --protocol udp --rate 2 --duration 2
+
+# Constant traffic of 100 packets/s per connection for 5 seconds
+python client.py --port 9000 --rate 2 --duration 5 --pps 100
 
 # 1KB random payload, 20 connections at 10/sec
 python client.py --port 9000 --rate 10 --total 20 --payload-size 1024
@@ -54,6 +61,9 @@ python server.py --port PORT [options]
 | `--host` | `0.0.0.0` | Bind host |
 | `--port` | *(required)* | Bind port |
 | `--protocol` | `tcp` | Protocol: `tcp` or `udp` |
+| `--output` | — | Optional file path to log the output results |
+
+> **Note**: TCP keepalive is automatically enabled for accepted TCP client connections.
 
 Press **Ctrl+C** to stop the server and print the full statistics summary.
 

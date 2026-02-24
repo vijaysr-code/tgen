@@ -6,12 +6,28 @@ Receives TCP or UDP connections and collects per-connection statistics.
 
 import asyncio
 import argparse
+import platform
 import signal
 import socket
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+
+class Tee:
+    def __init__(self, filename):
+        self.stdout = sys.stdout
+        self.file = open(filename, "a")
+
+    def write(self, data):
+        self.stdout.write(data)
+        self.file.write(data)
+        self.file.flush()
+
+    def flush(self):
+        self.stdout.flush()
+        self.file.flush()
 
 
 @dataclass
@@ -25,15 +41,24 @@ class ConnectionRecord:
 
     @property
     def duration(self) -> Optional[float]:
-        if self.disconnect_time is not None:
+        if self.disconnect_time is not None and self.connect_time is not None:
             return self.disconnect_time - self.connect_time
         return None
 
+    @property
+    def pps_observed(self) -> Optional[float]:
+        """Packets per second observed for this connection."""
+        dur = self.duration
+        if dur is not None and dur > 0:
+            return self.messages_received / dur
+        return None
+
     def row(self) -> str:
-        dur = f"{self.duration:.3f}s" if self.duration is not None else "open"
+        dur = f"{self.duration:.3f}s" if self.duration is not None else "open  "
+        pps = f"{self.pps_observed:.1f}" if self.pps_observed is not None else "  -  "
         return (
             f"  {self.conn_id:>6} | {self.client_addr:<22} | "
-            f"{dur:>10} | {self.bytes_received:>8}B | {self.messages_received:>5} msg"
+            f"{dur:>10} | {self.bytes_received:>8}B | {self.messages_received:>5} msg | {pps:>8} pkt/s"
         )
 
 
@@ -60,50 +85,98 @@ class ServerStats:
         completed = [r for r in self.records if r.duration is not None]
         total = len(self.records)
         rate = total / elapsed if elapsed > 0 else 0
+        total_pkts = sum(r.messages_received for r in self.records)
+        total_bytes = sum(r.bytes_received for r in self.records)
 
         lines = [
-            "\n" + "=" * 75,
+            "\n" + "=" * 85,
             "  SERVER SUMMARY",
-            "=" * 75,
+            "=" * 85,
             f"  Elapsed time        : {elapsed:.2f}s",
             f"  Total connections   : {total}",
             f"  Completed           : {len(completed)}",
             f"  Still open          : {total - len(completed)}",
             f"  Observed rate       : {rate:.2f} conn/s",
-            f"  Total bytes received: {sum(r.bytes_received for r in self.records)}",
+            f"  Total bytes received: {total_bytes}",
+            f"  Total packets recv  : {total_pkts}",
         ]
 
         if completed:
-            durations = [r.duration for r in completed]
-            avg = sum(durations) / len(durations)
-            lines += [
-                f"  Duration avg        : {avg:.3f}s",
-                f"  Duration min        : {min(durations):.3f}s",
-                f"  Duration max        : {max(durations):.3f}s",
-            ]
+            # Filter out any None durations defensively (race at shutdown)
+            durations: List[float] = [r.duration for r in completed if r.duration is not None]  # type: ignore[misc]
+            if durations:
+                avg_dur = sum(durations) / len(durations)
+                pps_vals: List[float] = []
+                for _r in completed:
+                    _p = _r.pps_observed
+                    if _p is not None:
+                        pps_vals.append(_p)
+                lines += [
+                    f"  Duration avg        : {avg_dur:.3f}s",
+                    f"  Duration min        : {min(durations):.3f}s",
+                    f"  Duration max        : {max(durations):.3f}s",
+                ]
+                if pps_vals:
+                    lines += [
+                        f"  PPS avg (recv)      : {sum(pps_vals)/len(pps_vals):.1f} pkt/s",
+                        f"  PPS min (recv)      : {min(pps_vals):.1f} pkt/s",
+                        f"  PPS max (recv)      : {max(pps_vals):.1f} pkt/s",
+                    ]
 
         if self.records:
             lines += [
                 "",
-                f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages",
-                "  " + "-" * 70,
+                f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages | PPS (recv)",
+                "  " + "-" * 80,
             ]
             for rec in self.records:
                 lines.append(rec.row())
 
-        lines.append("=" * 75)
+        lines.append("=" * 85)
         return "\n".join(lines)
 
 
 # ─── TCP ─────────────────────────────────────────────────────────────────────
+
+# TCP keepalive constants (always enabled for TCP connections)
+_KA_IDLE = 10      # seconds idle before first probe
+_KA_INTERVAL = 10  # seconds between probes
+_KA_COUNT = 5      # unacked probes before dropping
+
+
+def apply_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keepalive with fixed 10s idle/interval settings."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    system = platform.system()
+    if system == "Linux":
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KA_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+    elif system == "Darwin":  # macOS
+        TCP_KEEPALIVE = 0x10  # equivalent to TCP_KEEPIDLE on macOS
+        sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, _KA_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
 
 async def handle_tcp_client(reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
                              stats: ServerStats):
     addr = writer.get_extra_info("peername")
     addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
+
+    # Always apply keepalive on accepted TCP sockets
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        apply_keepalive(sock)
+
     rec = await stats.new_connection(addr_str)
-    print(f"[{rec.conn_id:>6}] TCP connect    | {addr_str}")
+    print(f"[{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
 
     try:
         while True:
@@ -128,8 +201,11 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
 
 
 async def run_tcp_server(host: str, port: int, stats: ServerStats):
+    async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+        await handle_tcp_client(r, w, stats)
+
     server = await asyncio.start_server(
-        lambda r, w: handle_tcp_client(r, w, stats),
+        handler,
         host, port
     )
     addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
@@ -151,11 +227,12 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         self.timeout = timeout
         self._sessions: Dict[tuple, ConnectionRecord] = {}
         self._timers: Dict[tuple, asyncio.TimerHandle] = {}
-        self._loop = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.transport: Optional[asyncio.DatagramTransport] = None
 
     def connection_made(self, transport):
-        self._loop = asyncio.get_event_loop()
-        self.transport = transport
+        self._loop = asyncio.get_running_loop()
+        self.transport = transport # type: ignore
 
     def datagram_received(self, data: bytes, addr: tuple):
         addr_str = f"{addr[0]}:{addr[1]}"
@@ -179,9 +256,10 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         # Reset inactivity timer
         if addr in self._timers:
             self._timers[addr].cancel()
-        self._timers[addr] = self._loop.call_later(
-            self.timeout, self._expire_session, addr
-        )
+        if self._loop is not None:
+            self._timers[addr] = self._loop.call_later(
+                self.timeout, self._expire_session, addr
+            )
 
     def _expire_session(self, addr: tuple):
         rec = self._sessions.pop(addr, None)
@@ -198,7 +276,7 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
 
 
 async def run_udp_server(host: str, port: int, stats: ServerStats):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # get_event_loop() is deprecated in async context
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: UDPServerProtocol(stats),
         local_addr=(host, port),
@@ -215,14 +293,16 @@ async def run_udp_server(host: str, port: int, stats: ServerStats):
 async def run_server(args):
     stats = ServerStats()
 
-    print(f"Starting traffic receiver")
+    print("Starting traffic receiver")
     print(f"  Protocol : {args.protocol.upper()}")
     print(f"  Bind     : {args.host}:{args.port}")
+    if args.protocol == "tcp":
+        print(f"  Keepalive: ON (idle={_KA_IDLE}s, intvl={_KA_INTERVAL}s, cnt={_KA_COUNT})")
     print("-" * 55)
 
     loop = asyncio.get_event_loop()
 
-    def shutdown():
+    def shutdown(*args):
         print("\nShutting down...")
         print(stats.summary())
         for task in asyncio.all_tasks(loop):
@@ -249,11 +329,21 @@ def parse_args():
     parser.add_argument("--port", type=int, required=True, help="Bind port")
     parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp",
                         help="Protocol to use")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Optional file path to log the output results")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    
+    if args.output:
+        try:
+            sys.stdout = Tee(args.output)
+        except Exception as e:
+            print(f"Error opening output file: {e}", file=sys.stderr)
+            sys.exit(1)
+
     try:
         asyncio.run(run_server(args))
     except KeyboardInterrupt:

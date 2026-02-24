@@ -7,7 +7,7 @@ Generates TCP or UDP traffic with configurable rate and connection duration.
 import asyncio
 import argparse
 import os
-import random
+import platform
 import socket
 import sys
 import time
@@ -15,11 +15,27 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+class Tee:
+    def __init__(self, filename):
+        self.stdout = sys.stdout
+        self.file = open(filename, "a")
+
+    def write(self, data):
+        self.stdout.write(data)
+        self.file.write(data)
+        self.file.flush()
+
+    def flush(self):
+        self.stdout.flush()
+        self.file.flush()
+
+
 @dataclass
 class ConnectionResult:
     conn_id: int
     success: bool
     latency_ms: float
+    packets_sent: int = 0
     error: Optional[str] = None
 
 
@@ -28,6 +44,7 @@ class Stats:
     total: int = 0
     success: int = 0
     failed: int = 0
+    total_packets: int = 0
     latencies: list = field(default_factory=list)
     start_time: float = field(default_factory=time.monotonic)
 
@@ -36,6 +53,7 @@ class Stats:
         if result.success:
             self.success += 1
             self.latencies.append(result.latency_ms)
+            self.total_packets += result.packets_sent
         else:
             self.failed += 1
 
@@ -51,6 +69,7 @@ class Stats:
             f"  Successful        : {self.success}",
             f"  Failed            : {self.failed}",
             f"  Observed rate     : {rate:.2f} conn/s",
+            f"  Total packets sent: {self.total_packets}",
         ]
         if self.latencies:
             avg = sum(self.latencies) / len(self.latencies)
@@ -64,26 +83,78 @@ class Stats:
 
 
 def make_payload(args) -> bytes:
-    if args.payload_size:
+    if args.payload_size > 0:
         return os.urandom(args.payload_size)
+    if not args.payload:
+        return b"PING"
     return args.payload.encode()
 
 
+# TCP keepalive constants (always enabled for TCP connections)
+_KA_IDLE = 10      # seconds idle before first probe
+_KA_INTERVAL = 10  # seconds between probes
+_KA_COUNT = 5      # unacked probes before dropping
+
+
+def apply_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keepalive with fixed 10s idle/interval settings."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    system = platform.system()
+    if system == "Linux":
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KA_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+    elif system == "Darwin":  # macOS
+        TCP_KEEPALIVE = 0x10  # equivalent to TCP_KEEPIDLE on macOS
+        sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, _KA_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+
+
 async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
-                         duration: float, stats: Stats):
+                         duration: float, stats: Stats, args=None):
     t0 = time.monotonic()
+    packets_sent = 0
+    pps = args.pps if args else 0
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=10
         )
+
+        # Apply TCP keepalive always
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            apply_keepalive(sock)
+
         latency_ms = (time.monotonic() - t0) * 1000
-        print(f"[{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms")
+        print(f"[{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
 
-        writer.write(payload)
-        await writer.drain()
-
-        if duration > 0:
-            await asyncio.sleep(duration)
+        if pps > 0 and duration > 0:
+            # Constant-rate packet sending for the connection duration.
+            # Deadline starts from now (post-connect), not from t0.
+            interval = 1.0 / pps
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline:
+                writer.write(payload)
+                await writer.drain()
+                packets_sent += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(interval, remaining))
+        else:
+            # Single send (original behaviour)
+            writer.write(payload)
+            await writer.drain()
+            packets_sent = 1
+            if duration > 0:
+                await asyncio.sleep(duration)
 
         writer.close()
         try:
@@ -91,7 +162,8 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         except Exception:
             pass
 
-        result = ConnectionResult(conn_id=conn_id, success=True, latency_ms=latency_ms)
+        result = ConnectionResult(conn_id=conn_id, success=True,
+                                  latency_ms=latency_ms, packets_sent=packets_sent)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         print(f"[{conn_id:>6}] TCP FAILED     | {e}")
@@ -101,42 +173,63 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
 
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
-                         duration: float, stats: Stats):
+                         duration: float, stats: Stats, args=None):
     t0 = time.monotonic()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # get_event_loop() is deprecated in async context
+    packets_sent = 0
+    pps = args.pps if args else 0
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
-        await loop.sock_sendto(sock, payload, (host, port))
-        latency_ms = (time.monotonic() - t0) * 1000
-        print(f"[{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
+        if pps > 0 and duration > 0:
+            # Constant-rate packet sending. Deadline from now, not from t0.
+            interval = 1.0 / pps
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline:
+                await loop.sock_sendto(sock, payload, (host, port))
+                packets_sent += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(interval, remaining))
+            latency_ms = (time.monotonic() - t0) * 1000
+            print(f"[{conn_id:>6}] UDP sent       | {packets_sent} pkts | {len(payload)}B each")
+        else:
+            await loop.sock_sendto(sock, payload, (host, port))
+            packets_sent = 1
+            latency_ms = (time.monotonic() - t0) * 1000
+            print(f"[{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
+            if duration > 0:
+                await asyncio.sleep(duration)
 
-        if duration > 0:
-            await asyncio.sleep(duration)
-
-        sock.close()
-        result = ConnectionResult(conn_id=conn_id, success=True, latency_ms=latency_ms)
+        result = ConnectionResult(conn_id=conn_id, success=True,
+                                  latency_ms=latency_ms, packets_sent=packets_sent)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         print(f"[{conn_id:>6}] UDP FAILED     | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
+    finally:
+        sock.close()  # always close, even on exception
     stats.record(result)
 
 
 async def run_client(args):
     stats = Stats()
     payload = make_payload(args)
-    interval = 1.0 / args.rate
+    interval = 1.0 / args.rate if args.rate > 0 else 0.0
     conn_id = 0
     tasks = set()
 
-    print(f"Starting traffic generator")
+    print("Starting traffic generator")
     print(f"  Target   : {args.protocol.upper()} {args.host}:{args.port}")
     print(f"  Rate     : {args.rate} conn/s  (interval={interval*1000:.1f}ms)")
     print(f"  Duration : {'long-lived (' + str(args.duration) + 's)' if args.duration > 0 else 'short-lived'}")
+    print(f"  PPS      : {'%g pkt/s per connection' % args.pps if args.pps > 0 else 'one-shot (no PPS)'}")
     print(f"  Total    : {'infinite' if args.total == 0 else args.total}")
     print(f"  Payload  : {len(payload)} bytes")
+    if args.protocol == "tcp":
+        print(f"  Keepalive: ON (idle={_KA_IDLE}s, intvl={_KA_INTERVAL}s, cnt={_KA_COUNT})")
     print("-" * 55)
 
     try:
@@ -144,10 +237,10 @@ async def run_client(args):
             conn_id += 1
             if args.protocol == "tcp":
                 coro = tcp_connection(conn_id, args.host, args.port, payload,
-                                      args.duration, stats)
+                                      args.duration, stats, args)
             else:
                 coro = udp_connection(conn_id, args.host, args.port, payload,
-                                      args.duration, stats)
+                                      args.duration, stats, args)
 
             task = asyncio.create_task(coro)
             tasks.add(task)
@@ -191,6 +284,11 @@ def parse_args():
                         help="Payload string to send")
     parser.add_argument("--payload-size", type=int, default=0,
                         help="Random payload size in bytes (overrides --payload)")
+    parser.add_argument("--pps", type=float, default=0.0,
+                        help="Packets per second to send within each connection "
+                             "(requires --duration > 0; 0 = send once and hold)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Optional file path to log the output results")
     return parser.parse_args()
 
 
@@ -199,6 +297,22 @@ def main():
     if args.rate <= 0:
         print("Error: --rate must be > 0", file=sys.stderr)
         sys.exit(1)
+    if args.pps < 0:
+        print("Error: --pps must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.duration < 0:
+        print("Error: --duration must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.pps > 0 and args.duration == 0:
+        print("Warning: --pps has no effect without --duration > 0 (single-shot mode)",
+              file=sys.stderr)
+
+    if args.output:
+        try:
+            sys.stdout = Tee(args.output)
+        except Exception as e:
+            print(f"Error opening output file: {e}", file=sys.stderr)
+            sys.exit(1)
 
     try:
         asyncio.run(run_client(args))
