@@ -23,11 +23,9 @@ class Tee:
     def write(self, data):
         self.stdout.write(data)
         self.file.write(data)
-        self.file.flush()
 
     def flush(self):
         self.stdout.flush()
-        self.file.flush()
 
 
 @dataclass
@@ -136,8 +134,6 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         print(f"[{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
 
         if pps > 0 and duration > 0:
-            # Constant-rate packet sending for the connection duration.
-            # Deadline starts from now (post-connect), not from t0.
             interval = 1.0 / pps
             deadline = time.monotonic() + duration
             while time.monotonic() < deadline:
@@ -178,15 +174,17 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
     loop = asyncio.get_running_loop()  # get_event_loop() is deprecated in async context
     packets_sent = 0
     pps = args.pps if args else 0
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setblocking(False)
+    transport = None
     try:
+        transport, protocol = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol,
+            remote_addr=(host, port)
+        )
         if pps > 0 and duration > 0:
-            # Constant-rate packet sending. Deadline from now, not from t0.
             interval = 1.0 / pps
             deadline = time.monotonic() + duration
             while time.monotonic() < deadline:
-                await loop.sock_sendto(sock, payload, (host, port))
+                transport.sendto(payload)
                 packets_sent += 1
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -195,7 +193,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             latency_ms = (time.monotonic() - t0) * 1000
             print(f"[{conn_id:>6}] UDP sent       | {packets_sent} pkts | {len(payload)}B each")
         else:
-            await loop.sock_sendto(sock, payload, (host, port))
+            transport.sendto(payload)
             packets_sent = 1
             latency_ms = (time.monotonic() - t0) * 1000
             print(f"[{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
@@ -210,7 +208,8 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
     finally:
-        sock.close()  # always close, even on exception
+        if transport is not None:
+            transport.close()  # always close, even on exception
     stats.record(result)
 
 
