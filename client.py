@@ -6,6 +6,7 @@ Generates TCP or UDP traffic with configurable rate and connection duration.
 
 import asyncio
 import argparse
+import hashlib
 import os
 import platform
 import socket
@@ -13,6 +14,32 @@ import sys
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+# Maximum allowed file size for -F / --file transfers (128 MiB)
+_MAX_FILE_SIZE = 128 * 1024 * 1024
+
+# Header format sent before file data:
+#   "TGEN_FILE:<sha256hex>:<size_10digits>\n"  (86 bytes total, fixed-width)
+_FILE_HEADER_PREFIX = b"TGEN_FILE:"
+_FILE_HEADER_LEN = len(_FILE_HEADER_PREFIX) + 64 + 1 + 10 + 1  # 86
+
+
+def build_file_header(data: bytes) -> bytes:
+    """Return the 86-byte fixed header for a file transfer."""
+    sha256 = hashlib.sha256(data).hexdigest()  # 64 hex chars
+    size_str = f"{len(data):010d}"             # 10-digit zero-padded size
+    return _FILE_HEADER_PREFIX + sha256.encode() + b":" + size_str.encode() + b"\n"
+
+
+def load_file_payload(path: str) -> bytes:
+    """Read file, enforce 128 MiB limit, return raw bytes."""
+    size = os.path.getsize(path)
+    if size > _MAX_FILE_SIZE:
+        raise ValueError(
+            f"File '{path}' is {size} bytes, exceeds 128 MiB limit ({_MAX_FILE_SIZE} bytes)"
+        )
+    with open(path, "rb") as fh:
+        return fh.read()
 
 
 class Tee:
@@ -81,11 +108,24 @@ class Stats:
 
 
 def make_payload(args) -> bytes:
+    """Build the payload bytes.  File mode is handled separately via make_file_transfer()."""
     if args.payload_size > 0:
         return os.urandom(args.payload_size)
     if not args.payload:
         return b"PING"
     return args.payload.encode()
+
+
+def make_file_transfer(args) -> Optional[tuple]:
+    """
+    If -F/--file is specified, return (header, file_data) ready to send.
+    Returns None when not in file-transfer mode.
+    """
+    if not args.file:
+        return None
+    data = load_file_payload(args.file)
+    header = build_file_header(data)
+    return header, data
 
 
 # TCP keepalive constants (always enabled for TCP connections)
@@ -113,6 +153,59 @@ def apply_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
         if hasattr(socket, "TCP_KEEPCNT"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+
+
+async def tcp_file_transfer(conn_id: int, host: str, port: int,
+                             header: bytes, file_data: bytes,
+                             stats: Stats):
+    """Send a file over TCP with a checksum header; report PASS/FAIL."""
+    t0 = time.monotonic()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10
+        )
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            apply_keepalive(sock)
+
+        latency_ms = (time.monotonic() - t0) * 1000
+
+        # Send header then file data
+        writer.write(header + file_data)
+        await writer.drain()
+
+        # Read server response: "OK\n" or "FAIL:<reason>\n"
+        response = await asyncio.wait_for(reader.readline(), timeout=30)
+        response_str = response.decode(errors="replace").strip()
+
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        if response_str == "OK":
+            print(
+                f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
+                f"total={elapsed_ms:.0f}ms {len(file_data)}B | checksum=PASS"
+            )
+            result = ConnectionResult(conn_id=conn_id, success=True,
+                                      latency_ms=latency_ms, packets_sent=1)
+        else:
+            print(
+                f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
+                f"total={elapsed_ms:.0f}ms {len(file_data)}B | checksum=FAIL ({response_str})"
+            )
+            result = ConnectionResult(conn_id=conn_id, success=False,
+                                      latency_ms=latency_ms,
+                                      error=f"checksum mismatch: {response_str}")
+    except Exception as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        print(f"[{conn_id:>6}] TCP file FAILED | {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=str(e))
+    stats.record(result)
 
 
 async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
@@ -215,18 +308,34 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
 async def run_client(args):
     stats = Stats()
-    payload = make_payload(args)
     interval = 1.0 / args.rate if args.rate > 0 else 0.0
     conn_id = 0
     tasks = set()
 
+    # File-transfer mode takes priority over normal payload
+    file_transfer = make_file_transfer(args)
+    if file_transfer is not None:
+        file_header, file_data = file_transfer
+        payload = file_data  # used only for size display
+        sha256 = hashlib.sha256(file_data).hexdigest()
+    else:
+        file_header = b""
+        file_data = b""
+        payload = make_payload(args)
+        sha256 = ""
+
     print("Starting traffic generator")
     print(f"  Target   : {args.protocol.upper()} {args.host}:{args.port}")
     print(f"  Rate     : {args.rate} conn/s  (interval={interval*1000:.1f}ms)")
-    print(f"  Duration : {'long-lived (' + str(args.duration) + 's)' if args.duration > 0 else 'short-lived'}")
-    print(f"  PPS      : {'%g pkt/s per connection' % args.pps if args.pps > 0 else 'one-shot (no PPS)'}")
+    if file_transfer is not None:
+        print(f"  Mode     : file transfer (-F {args.file})")
+        print(f"  File size: {len(file_data)} bytes")
+        print(f"  Checksum : SHA-256 {sha256}")
+    else:
+        print(f"  Duration : {'long-lived (' + str(args.duration) + 's)' if args.duration > 0 else 'short-lived'}")
+        print(f"  PPS      : {'%g pkt/s per connection' % args.pps if args.pps > 0 else 'one-shot (no PPS)'}")
+        print(f"  Payload  : {len(payload)} bytes")
     print(f"  Total    : {'infinite' if args.total == 0 else args.total}")
-    print(f"  Payload  : {len(payload)} bytes")
     if args.protocol == "tcp":
         print(f"  Keepalive: ON (idle={_KA_IDLE}s, intvl={_KA_INTERVAL}s, cnt={_KA_COUNT})")
     print("-" * 55)
@@ -234,7 +343,11 @@ async def run_client(args):
     try:
         while args.total == 0 or conn_id < args.total:
             conn_id += 1
-            if args.protocol == "tcp":
+            if file_transfer is not None:
+                # File-transfer mode: TCP only (UDP is unreliable for integrity checks)
+                coro = tcp_file_transfer(conn_id, args.host, args.port,
+                                         file_header, file_data, stats)
+            elif args.protocol == "tcp":
                 coro = tcp_connection(conn_id, args.host, args.port, payload,
                                       args.duration, stats, args)
             else:
@@ -286,6 +399,9 @@ def parse_args():
     parser.add_argument("--pps", type=float, default=0.0,
                         help="Packets per second to send within each connection "
                              "(requires --duration > 0; 0 = send once and hold)")
+    parser.add_argument("-F", "--file", type=str, default=None,
+                        help="File to send over each connection (max 128 MiB); "
+                             "server verifies SHA-256 checksum per connection")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")
     return parser.parse_args()
@@ -305,6 +421,16 @@ def main():
     if args.pps > 0 and args.duration == 0:
         print("Warning: --pps has no effect without --duration > 0 (single-shot mode)",
               file=sys.stderr)
+    if args.file and args.protocol == "udp":
+        print("Error: -F/--file is only supported with TCP (UDP is unreliable for integrity checks)",
+              file=sys.stderr)
+        sys.exit(1)
+    if args.file:
+        try:
+            load_file_payload(args.file)  # validate early: existence + size
+        except (OSError, ValueError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     if args.output:
         try:

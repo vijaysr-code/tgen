@@ -28,9 +28,12 @@ python client.py --port PORT [options]
 | `--payload` | `PING` | Payload string to send |
 | `--payload-size` | — | Random payload size in bytes (overrides `--payload`) |
 | `--pps` | `0.0` | Packets per second to send within each connection (requires `--duration > 0`) |
+| `-F`, `--file` | — | File to send over each TCP connection (max 128 MiB); server verifies SHA-256 checksum per connection |
 | `--output` | — | Optional file path to log the output results |
 
 > **Note**: TCP keepalive is enabled by default for all TCP connections with a 10s idle time and 10s interval.
+
+> **Note**: `-F/--file` is TCP-only. When specified, `--duration`, `--pps`, and `--payload` are ignored. The client sends a fixed 86-byte header (`TGEN_FILE:<sha256>:<size>`) followed by the raw file bytes. The server verifies the SHA-256 checksum and responds `OK` or `FAIL:<reason>` per connection.
 
 ### Examples
 
@@ -46,6 +49,9 @@ python client.py --port 9000 --rate 2 --duration 5 --pps 100
 
 # 1KB random payload, 20 connections at 10/sec
 python client.py --port 9000 --rate 10 --total 20 --payload-size 1024
+
+# Send a file over 5 TCP connections at 2/sec, server verifies checksum each time
+python client.py --port 9000 --rate 2 --total 5 -F /path/to/file.bin
 ```
 
 ---

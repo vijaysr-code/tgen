@@ -6,6 +6,7 @@ Receives TCP or UDP connections and collects per-connection statistics.
 
 import asyncio
 import argparse
+import hashlib
 import platform
 import signal
 import socket
@@ -13,6 +14,10 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+# Must match client.py constants
+_FILE_HEADER_PREFIX = b"TGEN_FILE:"
+_FILE_HEADER_LEN = len(_FILE_HEADER_PREFIX) + 64 + 1 + 10 + 1  # 86 bytes
 
 
 class Tee:
@@ -36,6 +41,9 @@ class ConnectionRecord:
     disconnect_time: Optional[float] = None
     bytes_received: int = 0
     messages_received: int = 0
+    # File-transfer fields (populated only in file-transfer mode)
+    file_transfer: bool = False
+    checksum_ok: Optional[bool] = None   # True=PASS, False=FAIL, None=N/A
 
     @property
     def duration(self) -> Optional[float]:
@@ -54,9 +62,18 @@ class ConnectionRecord:
     def row(self) -> str:
         dur = f"{self.duration:.3f}s" if self.duration is not None else "open  "
         pps = f"{self.pps_observed:.1f}" if self.pps_observed is not None else "  -  "
+        checksum_col = ""
+        if self.file_transfer:
+            if self.checksum_ok is True:
+                checksum_col = " | PASS"
+            elif self.checksum_ok is False:
+                checksum_col = " | FAIL"
+            else:
+                checksum_col = " | ?"
         return (
             f"  {self.conn_id:>6} | {self.client_addr:<22} | "
             f"{dur:>10} | {self.bytes_received:>8}B | {self.messages_received:>5} msg | {pps:>8} pkt/s"
+            f"{checksum_col}"
         )
 
 
@@ -87,9 +104,9 @@ class ServerStats:
         total_bytes = sum(r.bytes_received for r in self.records)
 
         lines = [
-            "\n" + "=" * 85,
+            "\n" + "=" * 92,
             "  SERVER SUMMARY",
-            "=" * 85,
+            "=" * 92,
             f"  Elapsed time        : {elapsed:.2f}s",
             f"  Total connections   : {total}",
             f"  Completed           : {len(completed)}",
@@ -98,6 +115,16 @@ class ServerStats:
             f"  Total bytes received: {total_bytes}",
             f"  Total packets recv  : {total_pkts}",
         ]
+
+        # File-transfer checksum summary
+        ft_records = [r for r in self.records if r.file_transfer]
+        if ft_records:
+            ft_pass = sum(1 for r in ft_records if r.checksum_ok is True)
+            ft_fail = sum(1 for r in ft_records if r.checksum_ok is False)
+            lines += [
+                f"  File transfers      : {len(ft_records)} "
+                f"(checksum PASS={ft_pass} FAIL={ft_fail})",
+            ]
 
         if completed:
             # Filter out any None durations defensively (race at shutdown)
@@ -122,15 +149,17 @@ class ServerStats:
                     ]
 
         if self.records:
+            has_ft = any(r.file_transfer for r in self.records)
+            checksum_hdr = " | Checksum" if has_ft else ""
             lines += [
                 "",
-                f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages | PPS (recv)",
-                "  " + "-" * 80,
+                f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages | PPS (recv){checksum_hdr}",
+                "  " + "-" * (80 + (10 if has_ft else 0)),
             ]
             for rec in self.records:
                 lines.append(rec.row())
 
-        lines.append("=" * 85)
+        lines.append("=" * 92)
         return "\n".join(lines)
 
 
@@ -162,6 +191,88 @@ def apply_keepalive(sock: socket.socket) -> None:
         if hasattr(socket, "TCP_KEEPCNT"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
 
+async def _handle_file_transfer(reader: asyncio.StreamReader,
+                                 writer: asyncio.StreamWriter,
+                                 rec: ConnectionRecord,
+                                 first_chunk: bytes) -> None:
+    """
+    Handle a file-transfer connection.
+
+    Protocol (client sends):
+        TGEN_FILE:<sha256hex(64)>:<size(10 digits)>\n  [86 bytes]
+        <raw file bytes>
+
+    Server responds with a single line:
+        OK\n          — checksum matched
+        FAIL:<msg>\n  — checksum mismatch or error
+    """
+    rec.file_transfer = True
+
+    # We already have the first chunk; read the rest of the header if needed
+    buf = first_chunk
+    while len(buf) < _FILE_HEADER_LEN:
+        more = await reader.read(_FILE_HEADER_LEN - len(buf))
+        if not more:
+            writer.write(b"FAIL:incomplete header\n")
+            await writer.drain()
+            rec.checksum_ok = False
+            return
+        buf += more
+
+    header = buf[:_FILE_HEADER_LEN]
+    leftover = buf[_FILE_HEADER_LEN:]
+
+    # Parse header: TGEN_FILE:<sha256>:<size>\n
+    try:
+        inner = header[len(_FILE_HEADER_PREFIX):].rstrip(b"\n")
+        sha256_expected, size_str = inner.split(b":", 1)
+        expected_sha256 = sha256_expected.decode()
+        expected_size = int(size_str.decode())
+    except Exception:
+        writer.write(b"FAIL:malformed header\n")
+        await writer.drain()
+        rec.checksum_ok = False
+        return
+
+    # Read exactly expected_size bytes
+    file_buf = bytearray(leftover)
+    while len(file_buf) < expected_size:
+        chunk = await reader.read(min(65536, expected_size - len(file_buf)))
+        if not chunk:
+            break
+        file_buf += chunk
+
+    rec.bytes_received += len(file_buf)
+    rec.messages_received = 1
+
+    if len(file_buf) != expected_size:
+        reason = f"size mismatch: got {len(file_buf)} expected {expected_size}"
+        writer.write(f"FAIL:{reason}\n".encode())
+        await writer.drain()
+        rec.checksum_ok = False
+        print(f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | FAIL {reason}")
+        return
+
+    actual_sha256 = hashlib.sha256(file_buf).hexdigest()
+    if actual_sha256 == expected_sha256:
+        writer.write(b"OK\n")
+        await writer.drain()
+        rec.checksum_ok = True
+        print(
+            f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | "
+            f"{len(file_buf)}B | checksum=PASS"
+        )
+    else:
+        reason = f"sha256 got={actual_sha256[:16]}... expected={expected_sha256[:16]}..."
+        writer.write(f"FAIL:{reason}\n".encode())
+        await writer.drain()
+        rec.checksum_ok = False
+        print(
+            f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | "
+            f"{len(file_buf)}B | checksum=FAIL"
+        )
+
+
 async def handle_tcp_client(reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
                              stats: ServerStats):
@@ -177,19 +288,30 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     print(f"[{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
 
     try:
-        while True:
-            data = await reader.read(65536)
-            if not data:
-                break
-            rec.bytes_received += len(data)
+        # Peek at the first bytes to detect file-transfer mode
+        first_chunk = await reader.read(len(_FILE_HEADER_PREFIX))
+        if first_chunk == _FILE_HEADER_PREFIX:
+            # File-transfer mode: read the rest of the header + file data
+            remaining_header = await reader.read(_FILE_HEADER_LEN - len(_FILE_HEADER_PREFIX))
+            await _handle_file_transfer(reader, writer, rec, first_chunk + remaining_header)
+        elif first_chunk:
+            # Normal traffic mode: count this chunk then keep reading
+            rec.bytes_received += len(first_chunk)
             rec.messages_received += 1
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                rec.bytes_received += len(data)
+                rec.messages_received += 1
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     finally:
         rec.disconnect_time = time.monotonic()
+        dur = rec.duration if rec.duration is not None else 0.0
         print(
             f"[{rec.conn_id:>6}] TCP disconnect | {addr_str} | "
-            f"dur={rec.duration:.3f}s | {rec.bytes_received}B"
+            f"dur={dur:.3f}s | {rec.bytes_received}B"
         )
         try:
             writer.close()
