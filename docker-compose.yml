@@ -1,0 +1,97 @@
+# Traffic Generator — Docker Compose
+#
+# Sysctl notes
+# ============
+# Only *namespaced* sysctls can be set per-container (net.* and fs.mqueue.*).
+# Host-scoped sysctls (fs.file-max, net.core.rmem_max, net.core.wmem_max)
+# must be set on the Docker host before starting containers:
+#
+#   sudo sysctl -w net.core.rmem_max=26214400
+#   sudo sysctl -w net.core.wmem_max=26214400
+#   sudo sysctl -w fs.file-max=1000000
+#
+# Usage
+# =====
+#   # Build image
+#   docker compose build
+#
+#   # Run TCP server + client (default)
+#   docker compose up
+#
+#   # Run UDP server + client
+#   docker compose run --rm tgen-server python3 server.py --port 9000 --protocol udp
+#   docker compose run --rm tgen-client python3 client.py --host tgen-server --port 9000 --protocol udp --rate 5 --total 10
+#
+#   # Override client options inline
+#   docker compose run --rm tgen-client python3 client.py \
+#       --host tgen-server --port 9000 --protocol tcp \
+#       --rate 10 --total 50 --duration 2 --pps 100
+
+services:
+
+  # ── Server ────────────────────────────────────────────────────────────────
+  tgen-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tgen-server
+    command: ["server.py", "--port", "9000"]
+    ports:
+      - "9000:9000/tcp"
+      - "9000:9000/udp"
+
+    # Namespaced sysctls — applied inside the container's network namespace
+    sysctls:
+      # Allow rapid reuse of TIME_WAIT sockets (critical for high-rate short-lived TCP)
+      net.ipv4.tcp_tw_reuse: 1
+      # Shorten FIN_WAIT2 linger time to free ports faster
+      net.ipv4.tcp_fin_timeout: 15
+      # Increase kernel accept() queue depth
+      net.core.somaxconn: 4096
+      # Larger SYN backlog to handle connection bursts
+      net.ipv4.tcp_max_syn_backlog: 4096
+      # UDP receive buffer default (prevents drops at high PPS)
+      net.core.rmem_default: 26214400
+      net.core.wmem_default: 26214400
+
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+
+  # ── Client ────────────────────────────────────────────────────────────────
+  tgen-client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tgen-client
+    # Default: 10 short-lived TCP connections at 5/sec
+    command:
+      - "client.py"
+      - "--host"
+      - "tgen-server"
+      - "--port"
+      - "9000"
+      - "--protocol"
+      - "tcp"
+      - "--rate"
+      - "5"
+      - "--total"
+      - "10"
+    depends_on:
+      - tgen-server
+
+    sysctls:
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 15
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.core.rmem_default: 26214400
+      net.core.wmem_default: 26214400
+
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+
+# Made with Bob
