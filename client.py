@@ -378,29 +378,79 @@ async def run_client(args):
 
 
 def parse_args():
+    epilog = """\
+SYNTAX
+------
+  python client.py --port PORT [options]
+
+OPTIONS
+-------
+  --host HOST           Target host (default: 127.0.0.1)
+  --port PORT           Target port (required)
+  --protocol {tcp,udp}  Protocol to use (default: tcp)
+  --rate RATE           Connections per second (default: 1.0)
+  --total N             Total connections to make; 0 = infinite (default: 0)
+  --duration SECS       Seconds to hold each connection open; 0 = short-lived (default: 0.0)
+  --payload TEXT        Payload string to send (default: PING)
+  --payload-size BYTES  Random payload size in bytes; overrides --payload (default: 0)
+  --pps PPS             Packets per second per connection; requires --duration > 0 (default: 0.0)
+  -F, --file PATH       File to send over each TCP connection (max 128 MiB);
+                        server verifies SHA-256 checksum per connection
+  --output PATH         Optional file path to log the output results
+  -h, --help            Show this help message and exit
+
+NOTES
+-----
+  * TCP keepalive is always enabled (idle=10s, interval=10s, count=5).
+  * -F/--file is TCP-only; --duration, --pps, and --payload are ignored in file mode.
+  * --pps has no effect unless --duration > 0.
+
+EXAMPLES
+--------
+  # 10 short-lived TCP connections at 5/sec
+  python client.py --port 9000 --rate 5 --total 10
+
+  # Long-lived UDP connections (2s each) at 2/sec, infinite
+  python client.py --port 9001 --protocol udp --rate 2 --duration 2
+
+  # 100 packets/s per connection for 5 seconds, 2 connections/sec
+  python client.py --port 9000 --rate 2 --duration 5 --pps 100
+
+  # 1 KB random payload, 20 connections at 10/sec
+  python client.py --port 9000 --rate 10 --total 20 --payload-size 1024
+
+  # Send a file over 5 TCP connections at 2/sec; server verifies checksum each time
+  python client.py --port 9000 --rate 2 --total 5 -F /path/to/file.bin
+
+  # Log all output to a file
+  python client.py --port 9000 --rate 5 --total 10 --output results.txt
+"""
     parser = argparse.ArgumentParser(
         description="Traffic Generator Client — sends TCP/UDP traffic at a configurable rate.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=epilog,
+        add_help=False,
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Target host")
-    parser.add_argument("--port", type=int, required=True, help="Target port")
+    parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS,
+                        help="Show this help message and exit")
+    parser.add_argument("--host", default="127.0.0.1", help="Target host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, required=True, help="Target port (required)")
     parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp",
-                        help="Protocol to use")
+                        help="Protocol to use: tcp or udp (default: tcp)")
     parser.add_argument("--rate", type=float, default=1.0,
-                        help="Connections per second")
+                        help="Connections per second (default: 1.0)")
     parser.add_argument("--total", type=int, default=0,
-                        help="Total connections to make (0 = infinite)")
+                        help="Total connections to make; 0 = infinite (default: 0)")
     parser.add_argument("--duration", type=float, default=0.0,
-                        help="Seconds to hold each connection open (0 = short-lived)")
+                        help="Seconds to hold each connection open; 0 = short-lived (default: 0.0)")
     parser.add_argument("--payload", default="PING",
-                        help="Payload string to send")
+                        help="Payload string to send (default: PING)")
     parser.add_argument("--payload-size", type=int, default=0,
-                        help="Random payload size in bytes (overrides --payload)")
+                        help="Random payload size in bytes; overrides --payload (default: 0)")
     parser.add_argument("--pps", type=float, default=0.0,
-                        help="Packets per second to send within each connection "
-                             "(requires --duration > 0; 0 = send once and hold)")
+                        help="Packets per second per connection; requires --duration > 0 (default: 0.0)")
     parser.add_argument("-F", "--file", type=str, default=None,
-                        help="File to send over each connection (max 128 MiB); "
+                        help="File to send over each TCP connection (max 128 MiB); "
                              "server verifies SHA-256 checksum per connection")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")

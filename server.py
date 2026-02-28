@@ -441,14 +441,50 @@ async def run_server(args):
 
 
 def parse_args():
+    epilog = """\
+SYNTAX
+------
+  python server.py --port PORT [options]
+
+OPTIONS
+-------
+  --host HOST           Address to bind on (default: 0.0.0.0)
+  --port PORT           Port to listen on (required)
+  --protocol {tcp,udp}  Protocol to use (default: tcp)
+  --output PATH         Optional file path to log the output results
+  -h, --help            Show this help message and exit
+
+NOTES
+-----
+  * TCP keepalive is automatically enabled for all accepted TCP connections
+    (idle=10s, interval=10s, count=5).
+  * UDP sessions are tracked per unique (host, port) pair and expire after
+    5 seconds of inactivity.
+  * Press Ctrl+C to stop the server and print the full statistics summary.
+
+EXAMPLES
+--------
+  # TCP server on port 9000
+  python server.py --port 9000
+
+  # UDP server on port 9001
+  python server.py --port 9001 --protocol udp
+
+  # TCP server bound to a specific interface, logging output to a file
+  python server.py --host 192.168.1.10 --port 9000 --output server.log
+"""
     parser = argparse.ArgumentParser(
         description="Traffic Generator Server — receives TCP/UDP connections and collects stats.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=epilog,
+        add_help=False,
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
-    parser.add_argument("--port", type=int, required=True, help="Bind port")
+    parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS,
+                        help="Show this help message and exit")
+    parser.add_argument("--host", default="0.0.0.0", help="Address to bind on (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, required=True, help="Port to listen on (required)")
     parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp",
-                        help="Protocol to use")
+                        help="Protocol to use: tcp or udp (default: tcp)")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")
     return parser.parse_args()
