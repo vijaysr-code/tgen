@@ -27,6 +27,25 @@
 #       --host tgen-server --port 9000 --protocol tcp \
 #       --rate 10 --total 50 --duration 2 --pps 100
 
+# ── Shared configuration anchors ──────────────────────────────────────────
+x-sysctls: &common-sysctls
+  # Allow rapid reuse of TIME_WAIT sockets (critical for high-rate short-lived TCP)
+  net.ipv4.tcp_tw_reuse: 1
+  # Shorten FIN_WAIT2 linger time to free ports faster
+  net.ipv4.tcp_fin_timeout: 15
+  # Increase kernel accept() queue depth
+  net.core.somaxconn: 4096
+  # Larger SYN backlog to handle connection bursts
+  net.ipv4.tcp_max_syn_backlog: 4096
+  # UDP receive buffer default (prevents drops at high PPS)
+  net.core.rmem_default: 26214400
+  net.core.wmem_default: 26214400
+
+x-ulimits: &common-ulimits
+  nofile:
+    soft: 1000000
+    hard: 1000000
+
 services:
 
   # ── Server ────────────────────────────────────────────────────────────────
@@ -39,25 +58,16 @@ services:
     ports:
       - "9000:9000/tcp"
       - "9000:9000/udp"
-
-    # Namespaced sysctls — applied inside the container's network namespace
-    sysctls:
-      # Allow rapid reuse of TIME_WAIT sockets (critical for high-rate short-lived TCP)
-      net.ipv4.tcp_tw_reuse: 1
-      # Shorten FIN_WAIT2 linger time to free ports faster
-      net.ipv4.tcp_fin_timeout: 15
-      # Increase kernel accept() queue depth
-      net.core.somaxconn: 4096
-      # Larger SYN backlog to handle connection bursts
-      net.ipv4.tcp_max_syn_backlog: 4096
-      # UDP receive buffer default (prevents drops at high PPS)
-      net.core.rmem_default: 26214400
-      net.core.wmem_default: 26214400
-
-    ulimits:
-      nofile:
-        soft: 1000000
-        hard: 1000000
+    sysctls: *common-sysctls
+    ulimits: *common-ulimits
+    # Health check: verify the server TCP port is accepting connections before
+    # the client starts (matches the HEALTHCHECK in the Dockerfile)
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import socket; s=socket.create_connection(('127.0.0.1',9000),2); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   # ── Client ────────────────────────────────────────────────────────────────
   tgen-client:
@@ -79,19 +89,9 @@ services:
       - "--total"
       - "10"
     depends_on:
-      - tgen-server
-
-    sysctls:
-      net.ipv4.tcp_tw_reuse: 1
-      net.ipv4.tcp_fin_timeout: 15
-      net.core.somaxconn: 4096
-      net.ipv4.tcp_max_syn_backlog: 4096
-      net.core.rmem_default: 26214400
-      net.core.wmem_default: 26214400
-
-    ulimits:
-      nofile:
-        soft: 1000000
-        hard: 1000000
+      tgen-server:
+        condition: service_healthy
+    sysctls: *common-sysctls
+    ulimits: *common-ulimits
 
 # Made with Bob

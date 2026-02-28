@@ -6,6 +6,7 @@ Generates TCP or UDP traffic with configurable rate and connection duration.
 
 import asyncio
 import argparse
+import atexit
 import hashlib
 import os
 import platform
@@ -46,6 +47,7 @@ class Tee:
     def __init__(self, filename):
         self.stdout = sys.stdout
         self.file = open(filename, "a")
+        atexit.register(self.file.close)
 
     def write(self, data):
         self.stdout.write(data)
@@ -53,6 +55,7 @@ class Tee:
 
     def flush(self):
         self.stdout.flush()
+        self.file.flush()
 
 
 @dataclass
@@ -111,9 +114,9 @@ def make_payload(args) -> bytes:
     """Build the payload bytes.  File mode is handled separately via make_file_transfer()."""
     if args.payload_size > 0:
         return os.urandom(args.payload_size)
-    if not args.payload:
-        return b"PING"
-    return args.payload.encode()
+    if args.payload:
+        return args.payload.encode()
+    return b"PING"
 
 
 def make_file_transfer(args) -> Optional[tuple]:
@@ -264,7 +267,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                          duration: float, stats: Stats, args=None):
     t0 = time.monotonic()
-    loop = asyncio.get_running_loop()  # get_event_loop() is deprecated in async context
+    loop = asyncio.get_running_loop()
     packets_sent = 0
     pps = args.pps if args else 0
     transport = None
@@ -273,6 +276,8 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             asyncio.DatagramProtocol,
             remote_addr=(host, port)
         )
+        # Capture latency right after endpoint creation (before any sends)
+        latency_ms = (time.monotonic() - t0) * 1000
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
             deadline = time.monotonic() + duration
@@ -283,12 +288,10 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval, remaining))
-            latency_ms = (time.monotonic() - t0) * 1000
             print(f"[{conn_id:>6}] UDP sent       | {packets_sent} pkts | {len(payload)}B each")
         else:
             transport.sendto(payload)
             packets_sent = 1
-            latency_ms = (time.monotonic() - t0) * 1000
             print(f"[{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
             if duration > 0:
                 await asyncio.sleep(duration)
@@ -369,9 +372,10 @@ async def run_client(args):
     except KeyboardInterrupt:
         pass
     finally:
-        # Cancel remaining tasks
-        for t in tasks:
-            t.cancel()
+        # Cancel remaining tasks (skip already-completed ones)
+        for t in list(tasks):
+            if not t.done():
+                t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         print(stats.summary())

@@ -6,6 +6,7 @@ Receives TCP or UDP connections and collects per-connection statistics.
 
 import asyncio
 import argparse
+import atexit
 import hashlib
 import platform
 import signal
@@ -18,12 +19,14 @@ from typing import Dict, List, Optional
 # Must match client.py constants
 _FILE_HEADER_PREFIX = b"TGEN_FILE:"
 _FILE_HEADER_LEN = len(_FILE_HEADER_PREFIX) + 64 + 1 + 10 + 1  # 86 bytes
+_SERVER_MAX_FILE_SIZE = 128 * 1024 * 1024  # 128 MiB — matches client limit
 
 
 class Tee:
     def __init__(self, filename):
         self.stdout = sys.stdout
         self.file = open(filename, "a")
+        atexit.register(self.file.close)
 
     def write(self, data):
         self.stdout.write(data)
@@ -31,6 +34,7 @@ class Tee:
 
     def flush(self):
         self.stdout.flush()
+        self.file.flush()
 
 
 @dataclass
@@ -95,6 +99,18 @@ class ServerStats:
             self.records.append(rec)
         return rec
 
+    def new_connection_sync(self, client_addr: str) -> ConnectionRecord:
+        """Synchronous variant for use in non-async callbacks (e.g. UDP datagram_received).
+        Safe because the event loop is single-threaded; no lock needed."""
+        rec = ConnectionRecord(
+            conn_id=self._next_id,
+            client_addr=client_addr,
+            connect_time=time.monotonic(),
+        )
+        self._next_id += 1
+        self.records.append(rec)
+        return rec
+
     def summary(self) -> str:
         elapsed = time.monotonic() - self.start_time
         completed = [r for r in self.records if r.duration is not None]
@@ -131,8 +147,11 @@ class ServerStats:
             durations: List[float] = [r.duration for r in completed if r.duration is not None]  # type: ignore[misc]
             if durations:
                 avg_dur = sum(durations) / len(durations)
+                # Exclude file-transfer connections from PPS stats (1 msg / ~0s = nonsensical)
                 pps_vals: List[float] = []
                 for _r in completed:
+                    if _r.file_transfer:
+                        continue
                     _p = _r.pps_observed
                     if _p is not None:
                         pps_vals.append(_p)
@@ -232,6 +251,14 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
         writer.write(b"FAIL:malformed header\n")
         await writer.drain()
         rec.checksum_ok = False
+        return
+
+    # Enforce server-side file size limit to prevent memory exhaustion
+    if expected_size > _SERVER_MAX_FILE_SIZE:
+        writer.write(b"FAIL:file too large\n")
+        await writer.drain()
+        rec.checksum_ok = False
+        print(f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | FAIL file too large ({expected_size}B)")
         return
 
     # Read exactly expected_size bytes
@@ -358,14 +385,8 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         addr_str = f"{addr[0]}:{addr[1]}"
 
         if addr not in self._sessions:
-            # New "connection"
-            rec = ConnectionRecord(
-                conn_id=self.stats._next_id,
-                client_addr=addr_str,
-                connect_time=time.monotonic(),
-            )
-            self.stats._next_id += 1
-            self.stats.records.append(rec)
+            # New "connection" — use sync helper (event loop is single-threaded here)
+            rec = self.stats.new_connection_sync(addr_str)
             self._sessions[addr] = rec
             print(f"[{rec.conn_id:>6}] UDP new sender | {addr_str}")
 
@@ -420,7 +441,7 @@ async def run_server(args):
         print(f"  Keepalive: ON (idle={_KA_IDLE}s, intvl={_KA_INTERVAL}s, cnt={_KA_COUNT})")
     print("-" * 55)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def shutdown(*args):
         print("\nShutting down...")
