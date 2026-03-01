@@ -32,15 +32,18 @@ def build_file_header(data: bytes) -> bytes:
     return _FILE_HEADER_PREFIX + sha256.encode() + b":" + size_str.encode() + b"\n"
 
 
-def load_file_payload(path: str) -> bytes:
-    """Read file, enforce 128 MiB limit, return raw bytes."""
+def load_file_metadata(path: str) -> tuple[int, str]:
+    """Read file size, enforce 128 MiB limit, compute SHA-256 without loading into memory."""
     size = os.path.getsize(path)
     if size > _MAX_FILE_SIZE:
         raise ValueError(
             f"File '{path}' is {size} bytes, exceeds 128 MiB limit ({_MAX_FILE_SIZE} bytes)"
         )
+    sha256 = hashlib.sha256()
     with open(path, "rb") as fh:
-        return fh.read()
+        while chunk := fh.read(65536):
+            sha256.update(chunk)
+    return size, sha256.hexdigest()
 
 
 class Tee:
@@ -119,16 +122,17 @@ def make_payload(args) -> bytes:
     return b"PING"
 
 
-def make_file_transfer(args) -> Optional[tuple]:
+def make_file_header(args) -> Optional[tuple]:
     """
-    If -F/--file is specified, return (header, file_data) ready to send.
+    If -F/--file is specified, return (header, size, sha256) ready to send.
     Returns None when not in file-transfer mode.
     """
     if not args.file:
         return None
-    data = load_file_payload(args.file)
-    header = build_file_header(data)
-    return header, data
+    size, sha256 = load_file_metadata(args.file)
+    size_str = f"{size:010d}"
+    header = _FILE_HEADER_PREFIX + sha256.encode() + b":" + size_str.encode() + b"\n"
+    return header, size, sha256
 
 
 # TCP keepalive constants (always enabled for TCP connections)
@@ -159,7 +163,7 @@ def apply_keepalive(sock: socket.socket) -> None:
 
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
-                             header: bytes, file_data: bytes,
+                             header: bytes, file_path: str, size: int,
                              stats: Stats):
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
@@ -173,9 +177,14 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
 
         latency_ms = (time.monotonic() - t0) * 1000
 
-        # Send header then file data
-        writer.write(header + file_data)
+        # Send header then file data chunk by chunk
+        writer.write(header)
         await writer.drain()
+        
+        with open(file_path, "rb") as fh:
+            while chunk := fh.read(65536):
+                writer.write(chunk)
+                await writer.drain()
 
         # Read server response: "OK\n" or "FAIL:<reason>\n"
         response = await asyncio.wait_for(reader.readline(), timeout=30)
@@ -191,14 +200,14 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         if response_str == "OK":
             print(
                 f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
-                f"total={elapsed_ms:.0f}ms {len(file_data)}B | checksum=PASS"
+                f"total={elapsed_ms:.0f}ms {size}B | checksum=PASS"
             )
             result = ConnectionResult(conn_id=conn_id, success=True,
                                       latency_ms=latency_ms, packets_sent=1)
         else:
             print(
                 f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
-                f"total={elapsed_ms:.0f}ms {len(file_data)}B | checksum=FAIL ({response_str})"
+                f"total={elapsed_ms:.0f}ms {size}B | checksum=FAIL ({response_str})"
             )
             result = ConnectionResult(conn_id=conn_id, success=False,
                                       latency_ms=latency_ms,
@@ -316,14 +325,12 @@ async def run_client(args):
     tasks = set()
 
     # File-transfer mode takes priority over normal payload
-    file_transfer = make_file_transfer(args)
+    file_transfer = make_file_header(args)
     if file_transfer is not None:
-        file_header, file_data = file_transfer
-        payload = file_data  # used only for size display
-        sha256 = hashlib.sha256(file_data).hexdigest()
+        file_header, file_size, sha256 = file_transfer
+        payload = b""  
     else:
         file_header = b""
-        file_data = b""
         payload = make_payload(args)
         sha256 = ""
 
@@ -332,7 +339,7 @@ async def run_client(args):
     print(f"  Rate     : {args.rate} conn/s  (interval={interval*1000:.1f}ms)")
     if file_transfer is not None:
         print(f"  Mode     : file transfer (-F {args.file})")
-        print(f"  File size: {len(file_data)} bytes")
+        print(f"  File size: {file_size} bytes")
         print(f"  Checksum : SHA-256 {sha256}")
     else:
         print(f"  Duration : {'long-lived (' + str(args.duration) + 's)' if args.duration > 0 else 'short-lived'}")
@@ -349,7 +356,7 @@ async def run_client(args):
             if file_transfer is not None:
                 # File-transfer mode: TCP only (UDP is unreliable for integrity checks)
                 coro = tcp_file_transfer(conn_id, args.host, args.port,
-                                         file_header, file_data, stats)
+                                         file_header, args.file, file_size, stats)
             elif args.protocol == "tcp":
                 coro = tcp_connection(conn_id, args.host, args.port, payload,
                                       args.duration, stats, args)
@@ -377,7 +384,9 @@ async def run_client(args):
             if not t.done():
                 t.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            _, pending = await asyncio.wait(tasks, timeout=3.0)
+            if pending:
+                print(f"Warning: {len(pending)} tasks did not finish gracefully within timeout.", file=sys.stderr)
         print(stats.summary())
 
 
@@ -481,7 +490,7 @@ def main():
         sys.exit(1)
     if args.file:
         try:
-            load_file_payload(args.file)  # validate early: existence + size
+            load_file_metadata(args.file)  # validate early: existence + size
         except (OSError, ValueError) as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)

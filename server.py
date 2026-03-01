@@ -227,7 +227,7 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
     """
     rec.file_transfer = True
 
-    # We already have the first chunk; read the rest of the header if needed
+    # Safely buffer until we have exactly _FILE_HEADER_LEN bytes
     buf = first_chunk
     while len(buf) < _FILE_HEADER_LEN:
         more = await reader.read(_FILE_HEADER_LEN - len(buf))
@@ -261,33 +261,40 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
         print(f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | FAIL file too large ({expected_size}B)")
         return
 
-    # Read exactly expected_size bytes
-    file_buf = bytearray(leftover)
-    while len(file_buf) < expected_size:
-        chunk = await reader.read(min(65536, expected_size - len(file_buf)))
+    # Read and hash chunk-by-chunk to avoid loading the whole file into memory
+    sha256_hasher = hashlib.sha256()
+    if leftover:
+        sha256_hasher.update(leftover)
+
+    bytes_read = len(leftover)
+    rec.bytes_received += bytes_read
+    
+    while bytes_read < expected_size:
+        chunk = await reader.read(min(65536, expected_size - bytes_read))
         if not chunk:
             break
-        file_buf += chunk
+        sha256_hasher.update(chunk)
+        bytes_read += len(chunk)
+        rec.bytes_received += len(chunk)
 
-    rec.bytes_received += len(file_buf)
     rec.messages_received = 1
 
-    if len(file_buf) != expected_size:
-        reason = f"size mismatch: got {len(file_buf)} expected {expected_size}"
+    if bytes_read != expected_size:
+        reason = f"size mismatch: got {bytes_read} expected {expected_size}"
         writer.write(f"FAIL:{reason}\n".encode())
         await writer.drain()
         rec.checksum_ok = False
         print(f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | FAIL {reason}")
         return
 
-    actual_sha256 = hashlib.sha256(file_buf).hexdigest()
+    actual_sha256 = sha256_hasher.hexdigest()
     if actual_sha256 == expected_sha256:
         writer.write(b"OK\n")
         await writer.drain()
         rec.checksum_ok = True
         print(
             f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | "
-            f"{len(file_buf)}B | checksum=PASS"
+            f"{bytes_read}B | checksum=PASS"
         )
     else:
         reason = f"sha256 got={actual_sha256[:16]}... expected={expected_sha256[:16]}..."
@@ -296,7 +303,7 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
         rec.checksum_ok = False
         print(
             f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | "
-            f"{len(file_buf)}B | checksum=FAIL"
+            f"{bytes_read}B | checksum=FAIL"
         )
 
 
@@ -315,15 +322,24 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     print(f"[{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
 
     try:
-        # Peek at the first bytes to detect file-transfer mode
-        first_chunk = await reader.read(len(_FILE_HEADER_PREFIX))
-        if first_chunk == _FILE_HEADER_PREFIX:
-            # File-transfer mode: read the rest of the header + file data
-            remaining_header = await reader.read(_FILE_HEADER_LEN - len(_FILE_HEADER_PREFIX))
-            await _handle_file_transfer(reader, writer, rec, first_chunk + remaining_header)
-        elif first_chunk:
-            # Normal traffic mode: count this chunk then keep reading
-            rec.bytes_received += len(first_chunk)
+        # buffer enough bytes to determine if it's a file header
+        prefix_len = len(_FILE_HEADER_PREFIX)
+        
+        # We need to read *at least* prefix_len bytes, but if the first read is smaller,
+        # we still can't be sure it's not a file transfer (due to TCP stream fragmentation).
+        buf: bytes = b""
+        while len(buf) < prefix_len:
+            chunk = await reader.read(min(65536, prefix_len - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+
+        if buf.startswith(_FILE_HEADER_PREFIX):
+            # File-transfer mode: pass the buffered header prefix along
+            await _handle_file_transfer(reader, writer, rec, buf)
+        elif buf:
+            # Normal traffic mode: count what we buffered, then keep reading
+            rec.bytes_received += len(buf)
             rec.messages_received += 1
             while True:
                 data = await reader.read(65536)
@@ -348,7 +364,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
 
 
 async def run_tcp_server(host: str, port: int, stats: ServerStats):
-    async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+    async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         await handle_tcp_client(r, w, stats)
 
     server = await asyncio.start_server(
@@ -397,8 +413,9 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         # Reset inactivity timer
         if addr in self._timers:
             self._timers[addr].cancel()
-        if self._loop is not None:
-            self._timers[addr] = self._loop.call_later(
+        loop = self._loop
+        if loop is not None:
+            self._timers[addr] = loop.call_later(
                 self.timeout, self._expire_session, addr
             )
 
