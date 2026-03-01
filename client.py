@@ -25,13 +25,6 @@ _FILE_HEADER_PREFIX = b"TGEN_FILE:"
 _FILE_HEADER_LEN = len(_FILE_HEADER_PREFIX) + 64 + 1 + 10 + 1  # 86
 
 
-def build_file_header(data: bytes) -> bytes:
-    """Return the 86-byte fixed header for a file transfer."""
-    sha256 = hashlib.sha256(data).hexdigest()  # 64 hex chars
-    size_str = f"{len(data):010d}"             # 10-digit zero-padded size
-    return _FILE_HEADER_PREFIX + sha256.encode() + b":" + size_str.encode() + b"\n"
-
-
 def load_file_metadata(path: str) -> tuple[int, str]:
     """Read file size, enforce 128 MiB limit, compute SHA-256 without loading into memory."""
     size = os.path.getsize(path)
@@ -167,6 +160,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                              stats: Stats):
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
+    result: ConnectionResult
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=10
@@ -217,7 +211,8 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         print(f"[{conn_id:>6}] TCP file FAILED | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
-    stats.record(result)
+    if result is not None:
+        stats.record(result)
 
 
 async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
@@ -225,6 +220,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     t0 = time.monotonic()
     packets_sent = 0
     pps = args.pps if args else 0
+    result: ConnectionResult
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=10
@@ -270,7 +266,8 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         print(f"[{conn_id:>6}] TCP FAILED     | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
-    stats.record(result)
+    if result is not None:
+        stats.record(result)
 
 
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
@@ -280,6 +277,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
     packets_sent = 0
     pps = args.pps if args else 0
     transport = None
+    result: ConnectionResult
     try:
         transport, protocol = await loop.create_datagram_endpoint(
             asyncio.DatagramProtocol,
@@ -297,7 +295,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval, remaining))
-            print(f"[{conn_id:>6}] UDP sent       | {packets_sent} pkts | {len(payload)}B each")
+            print(f"[{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)}B each")
         else:
             transport.sendto(payload)
             packets_sent = 1
@@ -315,7 +313,8 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
     finally:
         if transport is not None:
             transport.close()  # always close, even on exception
-    stats.record(result)
+    if result is not None:
+        stats.record(result)
 
 
 async def run_client(args):
@@ -372,7 +371,10 @@ async def run_client(args):
 
         # Wait for all in-flight connections to finish
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(tasks, timeout=30.0)
+            if pending:
+                print(f"Warning: {len(pending)} tasks still running after 30s.",
+                      file=sys.stderr)
 
     except asyncio.CancelledError:
         pass

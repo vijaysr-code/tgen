@@ -85,11 +85,17 @@ class ServerStats:
     def __init__(self):
         self.records: List[ConnectionRecord] = []
         self.start_time = time.monotonic()
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
         self._next_id = 1
 
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-initialize the lock inside a running event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock  # always non-None after assignment above
+
     async def new_connection(self, client_addr: str) -> ConnectionRecord:
-        async with self._lock:
+        async with self._get_lock():
             rec = ConnectionRecord(
                 conn_id=self._next_id,
                 client_addr=client_addr,
@@ -424,9 +430,10 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         self._timers.pop(addr, None)
         if rec:
             rec.disconnect_time = time.monotonic()
+            dur = rec.duration or 0.0
             print(
                 f"[{rec.conn_id:>6}] UDP expired    | {rec.client_addr} | "
-                f"dur={rec.duration:.3f}s | {rec.bytes_received}B"
+                f"dur={dur:.3f}s | {rec.bytes_received}B"
             )
 
     def error_received(self, exc):
@@ -460,7 +467,7 @@ async def run_server(args):
 
     loop = asyncio.get_running_loop()
 
-    def shutdown(*args):
+    def shutdown(*_):
         print("\nShutting down...")
         print(stats.summary())
         for task in asyncio.all_tasks(loop):
