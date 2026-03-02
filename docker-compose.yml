@@ -20,12 +20,12 @@
 #
 #   # Run UDP server + client
 #   docker compose run --rm tgen-server python3 server.py --port 9000 --protocol udp
-#   docker compose run --rm tgen-client python3 client.py --host tgen-server --port 9000 --protocol udp --rate 5 --total 10
+#   docker compose run --rm tgen-client python3 client.py --host tgen-server --port 9000 --protocol udp --cps 5 --total 10
 #
 #   # Override client options inline
 #   docker compose run --rm tgen-client python3 client.py \
 #       --host tgen-server --port 9000 --protocol tcp \
-#       --rate 10 --total 50 --duration 2 --pps 100
+#       --cps 10 --total 50 --duration 2 --pps 100
 
 # ── Shared configuration anchors ──────────────────────────────────────────
 x-sysctls: &common-sysctls
@@ -84,7 +84,7 @@ services:
       - "9000"
       - "--protocol"
       - "tcp"
-      - "--rate"
+      - "--cps"
       - "5"
       - "--total"
       - "10"

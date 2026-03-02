@@ -22,7 +22,7 @@ python client.py --port PORT [options]
 | `--host` | `127.0.0.1` | Target host |
 | `--port` | *(required)* | Target port |
 | `--protocol` | `tcp` | Protocol: `tcp` or `udp` |
-| `--rate` | `1.0` | Connections per second |
+| `--cps` | `1.0` | Connections per second |
 | `--total` | `0` | Total connections (0 = infinite) |
 | `--duration` | `0.0` | Seconds to hold each connection open (0 = short-lived) |
 | `--payload` | `PING` | Payload string to send |
@@ -39,19 +39,19 @@ python client.py --port PORT [options]
 
 ```bash
 # 10 short-lived TCP connections at 5/sec
-python client.py --port 9000 --rate 5 --total 10
+python client.py --port 9000 --cps 5 --total 10
 
 # Long-lived UDP connections (2s each) at 2/sec, infinite
-python client.py --port 9001 --protocol udp --rate 2 --duration 2
+python client.py --port 9001 --protocol udp --cps 2 --duration 2
 
 # Constant traffic of 100 packets/s per connection for 5 seconds
-python client.py --port 9000 --rate 2 --duration 5 --pps 100
+python client.py --port 9000 --cps 2 --duration 5 --pps 100
 
 # 1KB random payload, 20 connections at 10/sec
-python client.py --port 9000 --rate 10 --total 20 --payload-size 1024
+python client.py --port 9000 --cps 10 --total 20 --payload-size 1024
 
 # Send a file over 5 TCP connections at 2/sec, server verifies checksum each time
-python client.py --port 9000 --rate 2 --total 5 -F /path/to/file.bin
+python client.py --port 9000 --cps 2 --total 5 -F /path/to/file.bin
 ```
 
 ---
@@ -94,7 +94,7 @@ python server.py --port 9000 --protocol tcp
 
 **Terminal 2 — Run client:**
 ```bash
-python client.py --port 9000 --rate 5 --total 20 --duration 2
+python client.py --port 9000 --cps 5 --total 20 --duration 2
 ```
 
 Press Ctrl+C on the server to see the full per-connection statistics table.

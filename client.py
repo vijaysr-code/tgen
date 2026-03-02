@@ -14,7 +14,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 # Maximum allowed file size for -F / --file transfers (128 MiB)
 _MAX_FILE_SIZE = 128 * 1024 * 1024
@@ -69,7 +69,7 @@ class Stats:
     success: int = 0
     failed: int = 0
     total_packets: int = 0
-    latencies: list = field(default_factory=list)
+    latencies: List[float] = field(default_factory=list)
     start_time: float = field(default_factory=time.monotonic)
 
     def record(self, result: ConnectionResult):
@@ -115,14 +115,12 @@ def make_payload(args) -> bytes:
     return b"PING"
 
 
-def make_file_header(args) -> Optional[tuple]:
+def make_file_header(path: str) -> tuple:
     """
-    If -F/--file is specified, return (header, size, sha256) ready to send.
-    Returns None when not in file-transfer mode.
+    Build (header_bytes, size, sha256) for the given file path.
+    Caller is responsible for pre-validating the file (existence + size limit).
     """
-    if not args.file:
-        return None
-    size, sha256 = load_file_metadata(args.file)
+    size, sha256 = load_file_metadata(path)
     size_str = f"{size:010d}"
     header = _FILE_HEADER_PREFIX + sha256.encode() + b":" + size_str.encode() + b"\n"
     return header, size, sha256
@@ -160,7 +158,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                              stats: Stats):
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
-    result: ConnectionResult
+    result: Optional[ConnectionResult] = None
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=10
@@ -220,7 +218,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     t0 = time.monotonic()
     packets_sent = 0
     pps = args.pps if args else 0
-    result: ConnectionResult
+    result: Optional[ConnectionResult] = None
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=10
@@ -277,7 +275,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
     packets_sent = 0
     pps = args.pps if args else 0
     transport = None
-    result: ConnectionResult
+    result: Optional[ConnectionResult] = None
     try:
         transport, protocol = await loop.create_datagram_endpoint(
             asyncio.DatagramProtocol,
@@ -319,24 +317,26 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
 async def run_client(args):
     stats = Stats()
-    interval = 1.0 / args.rate if args.rate > 0 else 0.0
+    interval = 1.0 / args.cps if args.cps > 0 else 0.0
     conn_id = 0
     tasks = set()
 
-    # File-transfer mode takes priority over normal payload
-    file_transfer = make_file_header(args)
-    if file_transfer is not None:
-        file_header, file_size, sha256 = file_transfer
-        payload = b""  
+    # File-transfer mode: build header once (file already validated in main())
+    if args.file:
+        file_header, file_size, sha256 = make_file_header(args.file)
+        file_transfer = True
+        payload = b""
     else:
         file_header = b""
-        payload = make_payload(args)
+        file_size = 0
         sha256 = ""
+        file_transfer = False
+        payload = make_payload(args)
 
     print("Starting traffic generator")
     print(f"  Target   : {args.protocol.upper()} {args.host}:{args.port}")
-    print(f"  Rate     : {args.rate} conn/s  (interval={interval*1000:.1f}ms)")
-    if file_transfer is not None:
+    print(f"  CPS      : {args.cps} conn/s  (interval={interval*1000:.1f}ms)")
+    if file_transfer:
         print(f"  Mode     : file transfer (-F {args.file})")
         print(f"  File size: {file_size} bytes")
         print(f"  Checksum : SHA-256 {sha256}")
@@ -352,7 +352,7 @@ async def run_client(args):
     try:
         while args.total == 0 or conn_id < args.total:
             conn_id += 1
-            if file_transfer is not None:
+            if file_transfer:
                 # File-transfer mode: TCP only (UDP is unreliable for integrity checks)
                 coro = tcp_file_transfer(conn_id, args.host, args.port,
                                          file_header, args.file, file_size, stats)
@@ -403,7 +403,7 @@ OPTIONS
   --host HOST           Target host (default: 127.0.0.1)
   --port PORT           Target port (required)
   --protocol {tcp,udp}  Protocol to use (default: tcp)
-  --rate RATE           Connections per second (default: 1.0)
+  --cps CPS             Connections per second (default: 1.0)
   --total N             Total connections to make; 0 = infinite (default: 0)
   --duration SECS       Seconds to hold each connection open; 0 = short-lived (default: 0.0)
   --payload TEXT        Payload string to send (default: PING)
@@ -423,22 +423,22 @@ NOTES
 EXAMPLES
 --------
   # 10 short-lived TCP connections at 5/sec
-  python client.py --port 9000 --rate 5 --total 10
+  python client.py --port 9000 --cps 5 --total 10
 
   # Long-lived UDP connections (2s each) at 2/sec, infinite
-  python client.py --port 9001 --protocol udp --rate 2 --duration 2
+  python client.py --port 9001 --protocol udp --cps 2 --duration 2
 
   # 100 packets/s per connection for 5 seconds, 2 connections/sec
-  python client.py --port 9000 --rate 2 --duration 5 --pps 100
+  python client.py --port 9000 --cps 2 --duration 5 --pps 100
 
   # 1 KB random payload, 20 connections at 10/sec
-  python client.py --port 9000 --rate 10 --total 20 --payload-size 1024
+  python client.py --port 9000 --cps 10 --total 20 --payload-size 1024
 
   # Send a file over 5 TCP connections at 2/sec; server verifies checksum each time
-  python client.py --port 9000 --rate 2 --total 5 -F /path/to/file.bin
+  python client.py --port 9000 --cps 2 --total 5 -F /path/to/file.bin
 
   # Log all output to a file
-  python client.py --port 9000 --rate 5 --total 10 --output results.txt
+  python client.py --port 9000 --cps 5 --total 10 --output results.txt
 """
     parser = argparse.ArgumentParser(
         description="Traffic Generator Client — sends TCP/UDP traffic at a configurable rate.",
@@ -452,7 +452,7 @@ EXAMPLES
     parser.add_argument("--port", type=int, required=True, help="Target port (required)")
     parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp",
                         help="Protocol to use: tcp or udp (default: tcp)")
-    parser.add_argument("--rate", type=float, default=1.0,
+    parser.add_argument("--cps", type=float, default=1.0,
                         help="Connections per second (default: 1.0)")
     parser.add_argument("--total", type=int, default=0,
                         help="Total connections to make; 0 = infinite (default: 0)")
@@ -474,8 +474,8 @@ EXAMPLES
 
 def main():
     args = parse_args()
-    if args.rate <= 0:
-        print("Error: --rate must be > 0", file=sys.stderr)
+    if args.cps <= 0:
+        print("Error: --cps must be > 0", file=sys.stderr)
         sys.exit(1)
     if args.pps < 0:
         print("Error: --pps must be >= 0", file=sys.stderr)

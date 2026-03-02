@@ -107,7 +107,7 @@ Main client orchestration:
 | `--host` | `127.0.0.1` | Target host |
 | `--port` | *(required)* | Target port |
 | `--protocol` | `tcp` | Protocol: `tcp` or `udp` |
-| `--rate` | `1.0` | Connections per second |
+| `--cps` | `1.0` | Connections per second |
 | `--total` | `0` | Total connections (0 = infinite) |
 | `--duration` | `0.0` | Seconds to hold each connection open |
 | `--payload` | `PING` | Payload string to send |
@@ -117,7 +117,7 @@ Main client orchestration:
 
 #### Key Features
 
-1. **Rate Control**: Connections created at precise intervals (e.g., 5 conn/s = 200ms intervals)
+1. **CPS Control**: Connections created at precise intervals (e.g., `--cps 5` = 200ms intervals)
 2. **Packet-Per-Second (PPS) Mode**: Send continuous packets within long-lived connections
 3. **Flexible Payloads**: Custom strings or random bytes of specified size
 4. **TCP Keepalive**: Always enabled with 10s idle/interval for connection health monitoring
@@ -222,7 +222,7 @@ Main server orchestration:
    │                        │<────────────────────────┤
    │                        │                         │
    │ Start client           │                         │
-   │ (rate=5/s, total=20)   │                         │
+   │ (cps=5, total=20)      │                         │
    ├───────────────────────>│                         │
    │                        │                         │
    │                        │ Establish connection    │
@@ -338,41 +338,41 @@ Statistics collection:
 ### 1. Load Testing
 Generate sustained connection load to test server capacity:
 ```bash
-python client.py --port 9000 --rate 100 --total 10000
+python client.py --port 9000 --cps 100 --total 10000
 ```
 
 ### 2. Network Performance
 Measure latency and throughput under various conditions:
 ```bash
-python client.py --port 9000 --rate 10 --duration 5 --payload-size 1024
+python client.py --port 9000 --cps 10 --duration 5 --payload-size 1024
 ```
 
 ### 3. Connection Behavior
 Test long-lived vs short-lived connection handling:
 ```bash
 # Short-lived
-python client.py --port 9000 --rate 5 --total 100
+python client.py --port 9000 --cps 5 --total 100
 
 # Long-lived
-python client.py --port 9000 --rate 2 --duration 30 --total 100
+python client.py --port 9000 --cps 2 --duration 30 --total 100
 ```
 
 ### 4. Rate Limiting
 Verify rate limiting and connection throttling mechanisms:
 ```bash
-python client.py --port 9000 --rate 1000 --total 5000
+python client.py --port 9000 --cps 1000 --total 5000
 ```
 
 ### 5. Keepalive Testing
 Validate TCP keepalive behavior and connection health monitoring:
 ```bash
-python client.py --port 9000 --rate 1 --duration 60 --total 10
+python client.py --port 9000 --cps 1 --duration 60 --total 10
 ```
 
 ### 6. Packet Rate Testing
 Test sustained packet transmission within connections:
 ```bash
-python client.py --port 9000 --rate 2 --duration 10 --pps 100
+python client.py --port 9000 --cps 2 --duration 10 --pps 100
 ```
 
 ## Technical Details

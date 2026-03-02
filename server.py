@@ -269,12 +269,13 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
 
     # Read and hash chunk-by-chunk to avoid loading the whole file into memory
     sha256_hasher = hashlib.sha256()
+    bytes_read = 0
+
     if leftover:
         sha256_hasher.update(leftover)
+        bytes_read = len(leftover)
+        rec.bytes_received += bytes_read  # count leftover bytes received
 
-    bytes_read = len(leftover)
-    rec.bytes_received += bytes_read
-    
     while bytes_read < expected_size:
         chunk = await reader.read(min(65536, expected_size - bytes_read))
         if not chunk:
@@ -430,7 +431,7 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         self._timers.pop(addr, None)
         if rec:
             rec.disconnect_time = time.monotonic()
-            dur = rec.duration or 0.0
+            dur = rec.duration if rec.duration is not None else 0.0
             print(
                 f"[{rec.conn_id:>6}] UDP expired    | {rec.client_addr} | "
                 f"dur={dur:.3f}s | {rec.bytes_received}B"
