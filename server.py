@@ -13,6 +13,7 @@ import signal
 import socket
 import sys
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -326,7 +327,8 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
         apply_keepalive(sock)
 
     rec = await stats.new_connection(addr_str)
-    print(f"[{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] [{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
 
     try:
         # buffer enough bytes to determine if it's a file header
@@ -359,8 +361,9 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     finally:
         rec.disconnect_time = time.monotonic()
         dur = rec.duration if rec.duration is not None else 0.0
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         print(
-            f"[{rec.conn_id:>6}] TCP disconnect | {addr_str} | "
+            f"[{timestamp}] [{rec.conn_id:>6}] TCP disconnect | {addr_str} | "
             f"dur={dur:.3f}s | {rec.bytes_received}B"
         )
         try:
@@ -411,7 +414,8 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             # New "connection" — use sync helper (event loop is single-threaded here)
             rec = self.stats.new_connection_sync(addr_str)
             self._sessions[addr] = rec
-            print(f"[{rec.conn_id:>6}] UDP new sender | {addr_str}")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] [{rec.conn_id:>6}] UDP new sender | {addr_str}")
 
         rec = self._sessions[addr]
         rec.bytes_received += len(data)

@@ -13,6 +13,7 @@ import platform
 import socket
 import sys
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -231,7 +232,8 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             apply_keepalive(sock)
 
         latency_ms = (time.monotonic() - t0) * 1000
-        print(f"[{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print(f"[{timestamp}] [{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
 
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
@@ -294,11 +296,13 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval, remaining))
-            print(f"[{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)}B each")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)}B each")
         else:
             transport.sendto(payload)
             packets_sent = 1
-            print(f"[{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
             if duration > 0:
                 await asyncio.sleep(duration)
 
@@ -306,7 +310,8 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   latency_ms=latency_ms, packets_sent=packets_sent)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
-        print(f"[{conn_id:>6}] UDP FAILED     | {e}")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
     finally:
