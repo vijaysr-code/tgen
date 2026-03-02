@@ -26,16 +26,28 @@ _SERVER_MAX_FILE_SIZE = 128 * 1024 * 1024  # 128 MiB — matches client limit
 class Tee:
     def __init__(self, filename):
         self.stdout = sys.stdout
-        self.file = open(filename, "a")
-        atexit.register(self.file.close)
+        self.file = None
+        try:
+            self.file = open(filename, "a")
+            atexit.register(self.close)
+        except Exception:
+            if self.file:
+                self.file.close()
+            raise
 
     def write(self, data):
         self.stdout.write(data)
-        self.file.write(data)
+        if self.file:
+            self.file.write(data)
 
     def flush(self):
         self.stdout.flush()
-        self.file.flush()
+        if self.file:
+            self.file.flush()
+
+    def close(self):
+        if self.file and not self.file.closed:
+            self.file.close()
 
 
 @dataclass
