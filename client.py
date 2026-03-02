@@ -154,7 +154,7 @@ def apply_keepalive(sock: socket.socket) -> None:
 
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
-                             header: bytes, file_path: str, size: int,
+                             header: bytes, file_data: bytes, size: int,
                              stats: Stats):
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
@@ -169,14 +169,15 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
 
         latency_ms = (time.monotonic() - t0) * 1000
 
-        # Send header then file data chunk by chunk
+        # Send header then file data in chunks
         writer.write(header)
         await writer.drain()
         
-        with open(file_path, "rb") as fh:
-            while chunk := fh.read(65536):
-                writer.write(chunk)
-                await writer.drain()
+        # Send file data in 64KB chunks to avoid blocking the event loop
+        chunk_size = 65536
+        for i in range(0, len(file_data), chunk_size):
+            writer.write(file_data[i:i + chunk_size])
+            await writer.drain()
 
         # Read server response: "OK\n" or "FAIL:<reason>\n"
         response = await asyncio.wait_for(reader.readline(), timeout=30)
@@ -321,14 +322,18 @@ async def run_client(args):
     conn_id = 0
     tasks = set()
 
-    # File-transfer mode: build header once (file already validated in main())
+    # File-transfer mode: load file into memory once (file already validated in main())
     if args.file:
         file_header, file_size, sha256 = make_file_header(args.file)
+        # Read file content once and cache in memory for all connections
+        with open(args.file, "rb") as fh:
+            file_data = fh.read()
         file_transfer = True
         payload = b""
     else:
         file_header = b""
         file_size = 0
+        file_data = b""
         sha256 = ""
         file_transfer = False
         payload = make_payload(args)
@@ -355,7 +360,7 @@ async def run_client(args):
             if file_transfer:
                 # File-transfer mode: TCP only (UDP is unreliable for integrity checks)
                 coro = tcp_file_transfer(conn_id, args.host, args.port,
-                                         file_header, args.file, file_size, stats)
+                                         file_header, file_data, file_size, stats)
             elif args.protocol == "tcp":
                 coro = tcp_connection(conn_id, args.host, args.port, payload,
                                       args.duration, stats, args)
