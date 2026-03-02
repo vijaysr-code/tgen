@@ -13,9 +13,15 @@ import platform
 import socket
 import sys
 import time
-from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+
+def _format_timestamp() -> str:
+    """Fast timestamp formatting for logging. Returns ISO-8601 format with milliseconds."""
+    t = time.time()
+    ms = int((t % 1) * 1000)
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + f".{ms:03d}"
 
 # Maximum allowed file size for -F / --file transfers (128 MiB)
 _MAX_FILE_SIZE = 128 * 1024 * 1024
@@ -244,7 +250,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             apply_keepalive(sock)
 
         latency_ms = (time.monotonic() - t0) * 1000
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
 
         if pps > 0 and duration > 0:
@@ -308,12 +314,12 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval, remaining))
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            timestamp = _format_timestamp()
             print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)}B each")
         else:
             transport.sendto(payload)
             packets_sent = 1
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            timestamp = _format_timestamp()
             print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
             if duration > 0:
                 await asyncio.sleep(duration)
@@ -322,7 +328,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   latency_ms=latency_ms, packets_sent=packets_sent)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
