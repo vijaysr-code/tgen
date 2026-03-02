@@ -354,31 +354,55 @@ async def run_client(args):
         print(f"  Keepalive: ON (idle={_KA_IDLE}s, intvl={_KA_INTERVAL}s, cnt={_KA_COUNT})")
     print("-" * 55)
 
+    # Use absolute deadline-based scheduling to eliminate cumulative drift
+    start_time = time.monotonic()
+    
+    # Batch size for task creation: create multiple tasks before yielding to event loop
+    # This reduces context switching overhead when CPS is high
+    batch_size = max(1, min(10, int(args.cps / 10)))  # 10% of CPS, capped at 10
+    
     try:
         while args.total == 0 or conn_id < args.total:
-            conn_id += 1
-            if file_transfer:
-                # File-transfer mode: TCP only (UDP is unreliable for integrity checks)
-                coro = tcp_file_transfer(conn_id, args.host, args.port,
-                                         file_header, file_data, file_size, stats)
-            elif args.protocol == "tcp":
-                coro = tcp_connection(conn_id, args.host, args.port, payload,
-                                      args.duration, stats, args)
+            # Create a batch of tasks
+            batch_end = min(conn_id + batch_size, args.total) if args.total > 0 else conn_id + batch_size
+            
+            for _ in range(batch_size):
+                if args.total > 0 and conn_id >= args.total:
+                    break
+                    
+                conn_id += 1
+                if file_transfer:
+                    # File-transfer mode: TCP only (UDP is unreliable for integrity checks)
+                    coro = tcp_file_transfer(conn_id, args.host, args.port,
+                                             file_header, file_data, file_size, stats)
+                elif args.protocol == "tcp":
+                    coro = tcp_connection(conn_id, args.host, args.port, payload,
+                                          args.duration, stats, args)
+                else:
+                    coro = udp_connection(conn_id, args.host, args.port, payload,
+                                          args.duration, stats, args)
+
+                task = asyncio.create_task(coro)
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+
+            # Deadline-based scheduling: sleep until next connection should start
+            # This eliminates cumulative drift from task creation overhead
+            next_conn_time = start_time + (conn_id * interval)
+            sleep_duration = next_conn_time - time.monotonic()
+            if sleep_duration > 0:
+                await asyncio.sleep(sleep_duration)
             else:
-                coro = udp_connection(conn_id, args.host, args.port, payload,
-                                      args.duration, stats, args)
-
-            task = asyncio.create_task(coro)
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-
-            await asyncio.sleep(interval)
+                # If we're behind schedule, yield to event loop briefly
+                await asyncio.sleep(0)
 
         # Wait for all in-flight connections to finish
+        # Use duration + 10s buffer for long-lived connections, or 30s for short-lived
+        wait_timeout = (args.duration + 10.0) if args.duration else 30.0
         if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=30.0)
+            done, pending = await asyncio.wait(tasks, timeout=wait_timeout)
             if pending:
-                print(f"Warning: {len(pending)} tasks still running after 30s.",
+                print(f"Warning: {len(pending)} tasks still running after {wait_timeout:.0f}s.",
                       file=sys.stderr)
 
     except asyncio.CancelledError:
