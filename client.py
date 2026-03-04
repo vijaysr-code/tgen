@@ -391,11 +391,13 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
             deadline = time.monotonic() + duration
+            # Calculate expected packet count
+            expected_packets = int(duration * pps)
             seq_num = 0
             while time.monotonic() < deadline:
-                # Prepend sequence number (4 bytes, network byte order) to payload
+                # Prepend sequence number (4 bytes) and expected total (4 bytes) to payload
                 import struct
-                packet = struct.pack('!I', seq_num) + payload
+                packet = struct.pack('!II', seq_num, expected_packets) + payload
                 transport.sendto(packet)
                 packets_sent += 1
                 seq_num += 1
@@ -404,11 +406,11 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                     break
                 await asyncio.sleep(min(interval, remaining))
             timestamp = _format_timestamp()
-            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)+4}B each")
+            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)+8}B each")
         else:
-            # Single packet with sequence number 0
+            # Single packet with sequence number 0 and total 1
             import struct
-            packet = struct.pack('!I', 0) + payload
+            packet = struct.pack('!II', 0, 1) + payload
             transport.sendto(packet)
             packets_sent = 1
             timestamp = _format_timestamp()
