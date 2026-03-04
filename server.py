@@ -75,7 +75,8 @@ class ConnectionRecord:
     tcp_lost_packets: Optional[int] = None
     tcp_reordering: Optional[int] = None
     # UDP statistics (sequence number tracking)
-    udp_expected_seq: int = 0
+    udp_max_seq: int = -1  # Highest sequence number seen
+    udp_received_seqs: set = field(default_factory=set)  # Track received sequence numbers
     udp_lost_packets: int = 0
     udp_out_of_order: int = 0
     udp_duplicates: int = 0
@@ -121,7 +122,9 @@ class ConnectionRecord:
             base_row += tcp_stats
         
         if show_udp_stats and self.messages_received > 0:
-            loss_pct = (self.udp_lost_packets / (self.messages_received + self.udp_lost_packets) * 100) if (self.messages_received + self.udp_lost_packets) > 0 else 0
+            # Calculate loss percentage based on expected total packets
+            expected_total = self.udp_max_seq + 1 if self.udp_max_seq >= 0 else self.messages_received
+            loss_pct = (self.udp_lost_packets / expected_total * 100) if expected_total > 0 else 0
             udp_stats = f" | lost={self.udp_lost_packets:>3} ({loss_pct:>4.1f}%)"
             if self.udp_out_of_order > 0:
                 udp_stats += f" ooo={self.udp_out_of_order:>3}"
@@ -263,7 +266,8 @@ class ServerStats:
                 total_udp_lost = sum(r.udp_lost_packets for r in udp_records)
                 total_udp_ooo = sum(r.udp_out_of_order for r in udp_records)
                 total_udp_dup = sum(r.udp_duplicates for r in udp_records)
-                total_expected = sum(r.messages_received + r.udp_lost_packets for r in udp_records)
+                # Calculate total expected packets across all connections
+                total_expected = sum((r.udp_max_seq + 1) if r.udp_max_seq >= 0 else r.messages_received for r in udp_records)
                 loss_pct = (total_udp_lost / total_expected * 100) if total_expected > 0 else 0
                 
                 lines.append("")
@@ -576,30 +580,39 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
                 import struct
                 seq_num = struct.unpack('!I', data[:4])[0]
                 
-                # Track sequence numbers for loss detection
-                if rec.messages_received == 0:
-                    # First packet - initialize expected sequence
-                    rec.udp_expected_seq = seq_num + 1
+                # Track sequence numbers for loss detection using a set-based approach
+                if seq_num in rec.udp_received_seqs:
+                    # Duplicate packet
+                    rec.udp_duplicates += 1
                 else:
-                    if seq_num == rec.udp_expected_seq:
-                        # In-order packet
-                        rec.udp_expected_seq = seq_num + 1
-                    elif seq_num > rec.udp_expected_seq:
-                        # Gap detected - packets were lost
-                        lost = seq_num - rec.udp_expected_seq
-                        rec.udp_lost_packets += lost
-                        rec.udp_expected_seq = seq_num + 1
-                    elif seq_num < rec.udp_expected_seq:
-                        # Out of order or duplicate
-                        if seq_num >= rec.udp_expected_seq - 1000:  # reasonable window
-                            rec.udp_out_of_order += 1
-                        else:
-                            rec.udp_duplicates += 1
+                    # New packet
+                    rec.udp_received_seqs.add(seq_num)
+                    rec.messages_received += 1
+                    
+                    if seq_num > rec.udp_max_seq:
+                        # New highest sequence number
+                        if rec.udp_max_seq >= 0:
+                            # Check for gaps between old max and new max
+                            expected_count = seq_num - rec.udp_max_seq
+                            actual_new = 1  # Just this packet
+                            # Count how many packets in the gap we actually received
+                            for s in range(rec.udp_max_seq + 1, seq_num):
+                                if s in rec.udp_received_seqs:
+                                    actual_new += 1
+                            # Any missing packets in this range are considered lost
+                            gap_lost = expected_count - actual_new
+                            if gap_lost > 0:
+                                rec.udp_lost_packets += gap_lost
+                        rec.udp_max_seq = seq_num
+                    elif seq_num < rec.udp_max_seq:
+                        # Out of order packet (arrived after a higher seq number)
+                        rec.udp_out_of_order += 1
             except Exception:
                 # If sequence number extraction fails, just count the packet
-                pass
-        
-        rec.messages_received += 1
+                rec.messages_received += 1
+        else:
+            # Packet too small to contain sequence number
+            rec.messages_received += 1
 
         # Reset inactivity timer
         if addr in self._timers:
@@ -614,6 +627,16 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         rec = self._sessions.pop(addr, None)
         self._timers.pop(addr, None)
         if rec:
+            # Calculate final loss statistics based on sequence number range
+            if rec.udp_max_seq >= 0:
+                # Total packets expected = max_seq + 1 (since seq starts at 0)
+                expected_total = rec.udp_max_seq + 1
+                # Actual received = messages_received (unique packets)
+                actual_received = rec.messages_received
+                # Lost = expected - received
+                final_lost = expected_total - actual_received
+                rec.udp_lost_packets = max(0, final_lost)  # Ensure non-negative
+            
             rec.disconnect_time = time.monotonic()
             dur = rec.duration if rec.duration is not None else 0.0
             msg = (
@@ -621,7 +644,8 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
                 f"dur={dur:.3f}s | {rec.bytes_received}B"
             )
             if rec.udp_lost_packets > 0 or rec.udp_out_of_order > 0:
-                loss_pct = (rec.udp_lost_packets / (rec.messages_received + rec.udp_lost_packets) * 100) if (rec.messages_received + rec.udp_lost_packets) > 0 else 0
+                expected_total = rec.udp_max_seq + 1 if rec.udp_max_seq >= 0 else rec.messages_received
+                loss_pct = (rec.udp_lost_packets / expected_total * 100) if expected_total > 0 else 0
                 msg += f" | lost={rec.udp_lost_packets} ({loss_pct:.1f}%)"
                 if rec.udp_out_of_order > 0:
                     msg += f" ooo={rec.udp_out_of_order}"
