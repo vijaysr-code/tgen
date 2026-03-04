@@ -226,11 +226,12 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         tcp_info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
         
         # Parse relevant fields from tcp_info structure
+        # Offsets based on struct tcp_info (Linux kernel 4.x+, x86_64)
         import struct
         
-        retransmits = struct.unpack_from('B', tcp_info, 5)[0]
-        rtt_us = struct.unpack_from('I', tcp_info, 32)[0]
-        lost = struct.unpack_from('I', tcp_info, 72)[0]
+        retransmits = struct.unpack_from('B', tcp_info, 2)[0]   # tcpi_retransmits (u8)
+        rtt_us = struct.unpack_from('I', tcp_info, 68)[0]       # tcpi_rtt (u32, microseconds)
+        lost = struct.unpack_from('I', tcp_info, 32)[0]         # tcpi_lost (u32)
         
         # Convert microseconds to milliseconds
         rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
@@ -547,7 +548,7 @@ OPTIONS
   --port PORT           Target port (required)
   --protocol {tcp,udp}  Protocol to use (default: tcp)
   --cps CPS             Connections per second (default: 1.0)
-  --total N             Total connections to make; 0 = infinite (default: 0)
+  --total N             Total connections to make; 0 = infinite (default: 1000)
   --duration SECS       Seconds to hold each connection open; 0 = short-lived (default: 0.0)
   --payload TEXT        Payload string to send (default: PING)
   --payload-size BYTES  Random payload size in bytes; overrides --payload (default: 0)
@@ -568,7 +569,7 @@ EXAMPLES
   # 10 short-lived TCP connections at 5/sec
   python client.py --port 9000 --cps 5 --total 10
 
-  # Long-lived UDP connections (2s each) at 2/sec, infinite
+  # Long-lived UDP connections (2s each) at 2/sec, 1000 total (default)
   python client.py --port 9001 --protocol udp --cps 2 --duration 2
 
   # 100 packets/s per connection for 5 seconds, 2 connections/sec
@@ -597,8 +598,8 @@ EXAMPLES
                         help="Protocol to use: tcp or udp (default: tcp)")
     parser.add_argument("--cps", type=float, default=1.0,
                         help="Connections per second (default: 1.0)")
-    parser.add_argument("--total", type=int, default=0,
-                        help="Total connections to make; 0 = infinite (default: 0)")
+    parser.add_argument("--total", type=int, default=1000,
+                        help="Total connections to make; 0 = infinite (default: 1000)")
     parser.add_argument("--duration", type=float, default=0.0,
                         help="Seconds to hold each connection open; 0 = short-lived (default: 0.0)")
     parser.add_argument("--payload", default="PING",

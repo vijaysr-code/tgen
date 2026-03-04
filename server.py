@@ -324,25 +324,24 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         tcp_info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
         
         # Parse relevant fields from tcp_info structure
-        # Offsets based on Linux kernel struct tcp_info (x86_64)
-        # Note: This is a simplified parser for common fields
+        # Offsets based on Linux kernel struct tcp_info (kernel 4.x+, x86_64)
         import struct
         
+        # Correct offsets for struct tcp_info:
         # tcpi_state (u8) at offset 0
-        # tcpi_retransmits (u8) at offset 5
-        # tcpi_rto (u32) at offset 8
-        # tcpi_rtt (u32) at offset 32 (in microseconds)
-        # tcpi_rttvar (u32) at offset 36 (in microseconds)
-        # tcpi_snd_cwnd (u32) at offset 52
-        # tcpi_lost (u32) at offset 72
+        # tcpi_retransmits (u8) at offset 2  ← CORRECTED
+        # tcpi_lost (u32) at offset 32
+        # tcpi_rtt (u32) at offset 68 (in microseconds)  ← CORRECTED
+        # tcpi_rttvar (u32) at offset 72 (in microseconds)  ← CORRECTED
+        # tcpi_snd_cwnd (u32) at offset 80  ← CORRECTED
         # tcpi_reordering (u32) at offset 88
         
-        retransmits = struct.unpack_from('B', tcp_info, 5)[0]
-        rtt_us = struct.unpack_from('I', tcp_info, 32)[0]
-        rtt_var_us = struct.unpack_from('I', tcp_info, 36)[0]
-        snd_cwnd = struct.unpack_from('I', tcp_info, 52)[0]
-        lost = struct.unpack_from('I', tcp_info, 72)[0]
-        reordering = struct.unpack_from('I', tcp_info, 88)[0]
+        retransmits = struct.unpack_from('B', tcp_info, 2)[0]   # tcpi_retransmits (u8)
+        rtt_us = struct.unpack_from('I', tcp_info, 68)[0]       # tcpi_rtt (u32, microseconds)
+        rtt_var_us = struct.unpack_from('I', tcp_info, 72)[0]   # tcpi_rttvar (u32, microseconds)
+        snd_cwnd = struct.unpack_from('I', tcp_info, 80)[0]     # tcpi_snd_cwnd (u32)
+        lost = struct.unpack_from('I', tcp_info, 32)[0]         # tcpi_lost (u32)
+        reordering = struct.unpack_from('I', tcp_info, 88)[0]   # tcpi_reordering (u32)
         
         # Convert microseconds to milliseconds
         rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
