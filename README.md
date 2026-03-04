@@ -2,12 +2,23 @@
 
 A Python CLI tool for generating and receiving TCP/UDP traffic with configurable rate and connection duration.
 
+## Features
+
+- **TCP/UDP Traffic Generation**: Configurable connection rate, duration, and payload
+- **Per-Connection Statistics**: Detailed metrics for every connection
+- **TCP Statistics (Linux)**: Retransmits, RTT, packet loss, congestion window
+- **File Transfer Mode**: SHA-256 verified file transfers over TCP
+- **Keepalive Support**: Automatic TCP keepalive configuration
+- **High Performance**: Supports thousands of connections per second
+
 ## Files
 
 | File | Description |
 |---|---|
 | `client.py` | Traffic generator — sends connections at a configurable rate |
 | `server.py` | Traffic receiver — collects per-connection statistics |
+| `TCP_STATISTICS.md` | Detailed documentation on TCP statistics collection |
+| `test_tcp_stats.sh` | Test script for verifying TCP statistics functionality |
 
 ---
 
@@ -98,3 +109,35 @@ python client.py --port 9000 --cps 5 --total 20 --duration 2
 ```
 
 Press Ctrl+C on the server to see the full per-connection statistics table.
+
+---
+
+## TCP Statistics (Linux Only)
+
+The traffic generator collects detailed TCP socket statistics on Linux systems, including:
+
+- **Retransmits**: Number of TCP segment retransmissions
+- **RTT**: Round-trip time in milliseconds
+- **Lost Packets**: Number of packets marked as lost
+- **Congestion Window**: TCP send congestion window size
+
+These statistics are displayed in both real-time connection logs and the final summary.
+
+**Example output:**
+```
+[     1] TCP disconnect | 127.0.0.1:54321 | dur=2.345s | 1024B | retx=0 rtt=0.5ms lost=0
+
+TCP Statistics Summary:
+  Total retransmits : 5
+  Total lost packets: 0
+  RTT avg           : 0.85ms
+  RTT min           : 0.45ms
+  RTT max           : 1.50ms
+```
+
+For detailed information, see [`TCP_STATISTICS.md`](TCP_STATISTICS.md).
+
+**Test TCP statistics:**
+```bash
+./test_tcp_stats.sh
+```

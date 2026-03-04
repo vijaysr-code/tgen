@@ -13,8 +13,8 @@ import signal
 import socket
 import sys
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 
 def _format_timestamp() -> str:
@@ -67,6 +67,18 @@ class ConnectionRecord:
     # File-transfer fields (populated only in file-transfer mode)
     file_transfer: bool = False
     checksum_ok: Optional[bool] = None   # True=PASS, False=FAIL, None=N/A
+    # TCP statistics (Linux only)
+    tcp_retransmits: Optional[int] = None
+    tcp_rtt_ms: Optional[float] = None
+    tcp_rtt_var_ms: Optional[float] = None
+    tcp_snd_cwnd: Optional[int] = None
+    tcp_lost_packets: Optional[int] = None
+    tcp_reordering: Optional[int] = None
+    # UDP statistics (sequence number tracking)
+    udp_expected_seq: int = 0
+    udp_lost_packets: int = 0
+    udp_out_of_order: int = 0
+    udp_duplicates: int = 0
 
     @property
     def duration(self) -> Optional[float]:
@@ -82,7 +94,7 @@ class ConnectionRecord:
             return self.messages_received / dur
         return None
 
-    def row(self) -> str:
+    def row(self, show_tcp_stats: bool = False, show_udp_stats: bool = False) -> str:
         dur = f"{self.duration:.3f}s" if self.duration is not None else "open  "
         pps = f"{self.pps_observed:.1f}" if self.pps_observed is not None else "  -  "
         checksum_col = ""
@@ -93,11 +105,31 @@ class ConnectionRecord:
                 checksum_col = " | FAIL"
             else:
                 checksum_col = " | ?"
-        return (
+        
+        base_row = (
             f"  {self.conn_id:>6} | {self.client_addr:<22} | "
             f"{dur:>10} | {self.bytes_received:>8}B | {self.messages_received:>5} msg | {pps:>8} pkt/s"
             f"{checksum_col}"
         )
+        
+        if show_tcp_stats and self.tcp_retransmits is not None:
+            tcp_stats = f" | retx={self.tcp_retransmits:>3}"
+            if self.tcp_rtt_ms is not None:
+                tcp_stats += f" rtt={self.tcp_rtt_ms:>5.1f}ms"
+            if self.tcp_lost_packets is not None:
+                tcp_stats += f" lost={self.tcp_lost_packets:>3}"
+            base_row += tcp_stats
+        
+        if show_udp_stats and self.messages_received > 0:
+            loss_pct = (self.udp_lost_packets / (self.messages_received + self.udp_lost_packets) * 100) if (self.messages_received + self.udp_lost_packets) > 0 else 0
+            udp_stats = f" | lost={self.udp_lost_packets:>3} ({loss_pct:>4.1f}%)"
+            if self.udp_out_of_order > 0:
+                udp_stats += f" ooo={self.udp_out_of_order:>3}"
+            if self.udp_duplicates > 0:
+                udp_stats += f" dup={self.udp_duplicates:>3}"
+            base_row += udp_stats
+        
+        return base_row
 
 
 class ServerStats:
@@ -194,14 +226,51 @@ class ServerStats:
 
         if self.records:
             has_ft = any(r.file_transfer for r in self.records)
+            has_tcp_stats = any(r.tcp_retransmits is not None for r in self.records)
+            # Only show UDP stats if we have UDP connections (no TCP stats present)
+            has_udp_stats = any(r.messages_received > 0 and r.tcp_retransmits is None and (r.udp_lost_packets > 0 or r.udp_out_of_order > 0 or r.udp_duplicates > 0) for r in self.records)
             checksum_hdr = " | Checksum" if has_ft else ""
+            tcp_hdr = " | TCP Stats (retx/rtt/lost)" if has_tcp_stats else ""
+            udp_hdr = " | UDP Stats (lost/ooo/dup)" if has_udp_stats else ""
+            
             lines += [
                 "",
-                f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages | PPS (recv){checksum_hdr}",
-                "  " + "-" * (80 + (10 if has_ft else 0)),
+                f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages | PPS (recv){checksum_hdr}{tcp_hdr}{udp_hdr}",
+                "  " + "-" * (80 + (10 if has_ft else 0) + (35 if has_tcp_stats else 0) + (35 if has_udp_stats else 0)),
             ]
             for rec in self.records:
-                lines.append(rec.row())
+                lines.append(rec.row(show_tcp_stats=has_tcp_stats, show_udp_stats=has_udp_stats))
+            
+            # Add TCP statistics summary if available
+            if has_tcp_stats:
+                tcp_records = [r for r in self.records if r.tcp_retransmits is not None]
+                total_retx = sum(r.tcp_retransmits for r in tcp_records if r.tcp_retransmits is not None)
+                total_lost = sum(r.tcp_lost_packets for r in tcp_records if r.tcp_lost_packets is not None)
+                rtt_vals = [r.tcp_rtt_ms for r in tcp_records if r.tcp_rtt_ms is not None]
+                
+                lines.append("")
+                lines.append(f"  TCP Statistics Summary:")
+                lines.append(f"    Total retransmits : {total_retx}")
+                lines.append(f"    Total lost packets: {total_lost}")
+                if rtt_vals:
+                    lines.append(f"    RTT avg           : {sum(rtt_vals)/len(rtt_vals):.2f}ms")
+                    lines.append(f"    RTT min           : {min(rtt_vals):.2f}ms")
+                    lines.append(f"    RTT max           : {max(rtt_vals):.2f}ms")
+            
+            # Add UDP statistics summary if available
+            if has_udp_stats:
+                udp_records = [r for r in self.records if r.messages_received > 0 and r.tcp_retransmits is None]
+                total_udp_lost = sum(r.udp_lost_packets for r in udp_records)
+                total_udp_ooo = sum(r.udp_out_of_order for r in udp_records)
+                total_udp_dup = sum(r.udp_duplicates for r in udp_records)
+                total_expected = sum(r.messages_received + r.udp_lost_packets for r in udp_records)
+                loss_pct = (total_udp_lost / total_expected * 100) if total_expected > 0 else 0
+                
+                lines.append("")
+                lines.append(f"  UDP Statistics Summary:")
+                lines.append(f"    Total lost packets: {total_udp_lost} ({loss_pct:.2f}%)")
+                lines.append(f"    Out of order      : {total_udp_ooo}")
+                lines.append(f"    Duplicates        : {total_udp_dup}")
 
         lines.append("=" * 92)
         return "\n".join(lines)
@@ -234,6 +303,55 @@ def apply_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
         if hasattr(socket, "TCP_KEEPCNT"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+
+
+def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[float],
+                                                 Optional[int], Optional[int], Optional[int]]:
+    """
+    Retrieve TCP socket statistics (Linux only).
+    Returns: (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost_packets, reordering)
+    """
+    system = platform.system()
+    if system != "Linux":
+        return (None, None, None, None, None, None)
+    
+    try:
+        # TCP_INFO socket option (Linux-specific)
+        # struct tcp_info is defined in <linux/tcp.h>
+        TCP_INFO = 11
+        
+        # Get TCP_INFO structure (size varies by kernel version, but we only need first ~200 bytes)
+        tcp_info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
+        
+        # Parse relevant fields from tcp_info structure
+        # Offsets based on Linux kernel struct tcp_info (x86_64)
+        # Note: This is a simplified parser for common fields
+        import struct
+        
+        # tcpi_state (u8) at offset 0
+        # tcpi_retransmits (u8) at offset 5
+        # tcpi_rto (u32) at offset 8
+        # tcpi_rtt (u32) at offset 32 (in microseconds)
+        # tcpi_rttvar (u32) at offset 36 (in microseconds)
+        # tcpi_snd_cwnd (u32) at offset 52
+        # tcpi_lost (u32) at offset 72
+        # tcpi_reordering (u32) at offset 88
+        
+        retransmits = struct.unpack_from('B', tcp_info, 5)[0]
+        rtt_us = struct.unpack_from('I', tcp_info, 32)[0]
+        rtt_var_us = struct.unpack_from('I', tcp_info, 36)[0]
+        snd_cwnd = struct.unpack_from('I', tcp_info, 52)[0]
+        lost = struct.unpack_from('I', tcp_info, 72)[0]
+        reordering = struct.unpack_from('I', tcp_info, 88)[0]
+        
+        # Convert microseconds to milliseconds
+        rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
+        rtt_var_ms = rtt_var_us / 1000.0 if rtt_var_us > 0 else None
+        
+        return (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost, reordering)
+    except Exception:
+        # TCP_INFO not available or parsing failed
+        return (None, None, None, None, None, None)
 
 async def _handle_file_transfer(reader: asyncio.StreamReader,
                                  writer: asyncio.StreamWriter,
@@ -377,13 +495,28 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     finally:
+        # Collect TCP statistics before closing
+        if sock is not None:
+            (rec.tcp_retransmits, rec.tcp_rtt_ms, rec.tcp_rtt_var_ms,
+             rec.tcp_snd_cwnd, rec.tcp_lost_packets, rec.tcp_reordering) = get_tcp_info(sock)
+        
         rec.disconnect_time = time.monotonic()
         dur = rec.duration if rec.duration is not None else 0.0
         timestamp = _format_timestamp()
-        print(
+        
+        # Enhanced disconnect message with TCP stats
+        disconnect_msg = (
             f"[{timestamp}] [{rec.conn_id:>6}] TCP disconnect | {addr_str} | "
             f"dur={dur:.3f}s | {rec.bytes_received}B"
         )
+        if rec.tcp_retransmits is not None:
+            disconnect_msg += f" | retx={rec.tcp_retransmits}"
+            if rec.tcp_rtt_ms is not None:
+                disconnect_msg += f" rtt={rec.tcp_rtt_ms:.1f}ms"
+            if rec.tcp_lost_packets is not None and rec.tcp_lost_packets > 0:
+                disconnect_msg += f" lost={rec.tcp_lost_packets}"
+        print(disconnect_msg)
+        
         try:
             writer.close()
             await writer.wait_closed()
@@ -437,6 +570,36 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
 
         rec = self._sessions[addr]
         rec.bytes_received += len(data)
+        
+        # Try to extract sequence number from payload (first 4 bytes as uint32)
+        if len(data) >= 4:
+            try:
+                import struct
+                seq_num = struct.unpack('!I', data[:4])[0]
+                
+                # Track sequence numbers for loss detection
+                if rec.messages_received == 0:
+                    # First packet - initialize expected sequence
+                    rec.udp_expected_seq = seq_num + 1
+                else:
+                    if seq_num == rec.udp_expected_seq:
+                        # In-order packet
+                        rec.udp_expected_seq = seq_num + 1
+                    elif seq_num > rec.udp_expected_seq:
+                        # Gap detected - packets were lost
+                        lost = seq_num - rec.udp_expected_seq
+                        rec.udp_lost_packets += lost
+                        rec.udp_expected_seq = seq_num + 1
+                    elif seq_num < rec.udp_expected_seq:
+                        # Out of order or duplicate
+                        if seq_num >= rec.udp_expected_seq - 1000:  # reasonable window
+                            rec.udp_out_of_order += 1
+                        else:
+                            rec.udp_duplicates += 1
+            except Exception:
+                # If sequence number extraction fails, just count the packet
+                pass
+        
         rec.messages_received += 1
 
         # Reset inactivity timer
@@ -454,10 +617,16 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         if rec:
             rec.disconnect_time = time.monotonic()
             dur = rec.duration if rec.duration is not None else 0.0
-            print(
+            msg = (
                 f"[{rec.conn_id:>6}] UDP expired    | {rec.client_addr} | "
                 f"dur={dur:.3f}s | {rec.bytes_received}B"
             )
+            if rec.udp_lost_packets > 0 or rec.udp_out_of_order > 0:
+                loss_pct = (rec.udp_lost_packets / (rec.messages_received + rec.udp_lost_packets) * 100) if (rec.messages_received + rec.udp_lost_packets) > 0 else 0
+                msg += f" | lost={rec.udp_lost_packets} ({loss_pct:.1f}%)"
+                if rec.udp_out_of_order > 0:
+                    msg += f" ooo={rec.udp_out_of_order}"
+            print(msg)
 
     def error_received(self, exc):
         print(f"UDP error: {exc}", file=sys.stderr)

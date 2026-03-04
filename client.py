@@ -14,7 +14,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 def _format_timestamp() -> str:
@@ -80,6 +80,10 @@ class ConnectionResult:
     latency_ms: float
     packets_sent: int = 0
     error: Optional[str] = None
+    # TCP statistics (Linux only)
+    tcp_retransmits: Optional[int] = None
+    tcp_rtt_ms: Optional[float] = None
+    tcp_lost_packets: Optional[int] = None
 
 
 @dataclass
@@ -90,6 +94,9 @@ class Stats:
     total_packets: int = 0
     latencies: List[float] = field(default_factory=list)
     start_time: float = field(default_factory=time.monotonic)
+    tcp_retransmits_list: List[int] = field(default_factory=list)
+    tcp_rtt_list: List[float] = field(default_factory=list)
+    tcp_lost_list: List[int] = field(default_factory=list)
 
     def record(self, result: ConnectionResult):
         self.total += 1
@@ -97,6 +104,12 @@ class Stats:
             self.success += 1
             self.latencies.append(result.latency_ms)
             self.total_packets += result.packets_sent
+            if result.tcp_retransmits is not None:
+                self.tcp_retransmits_list.append(result.tcp_retransmits)
+            if result.tcp_rtt_ms is not None:
+                self.tcp_rtt_list.append(result.tcp_rtt_ms)
+            if result.tcp_lost_packets is not None:
+                self.tcp_lost_list.append(result.tcp_lost_packets)
         else:
             self.failed += 1
 
@@ -121,6 +134,30 @@ class Stats:
                 f"  Latency min       : {min(self.latencies):.2f}ms",
                 f"  Latency max       : {max(self.latencies):.2f}ms",
             ]
+        
+        # TCP statistics summary
+        if self.tcp_retransmits_list:
+            total_retx = sum(self.tcp_retransmits_list)
+            lines += [
+                "",
+                "  TCP Statistics:",
+                f"    Total retransmits : {total_retx}",
+                f"    Avg retransmits   : {total_retx/len(self.tcp_retransmits_list):.1f} per conn",
+            ]
+        if self.tcp_rtt_list:
+            avg_rtt = sum(self.tcp_rtt_list) / len(self.tcp_rtt_list)
+            lines += [
+                f"    RTT avg           : {avg_rtt:.2f}ms",
+                f"    RTT min           : {min(self.tcp_rtt_list):.2f}ms",
+                f"    RTT max           : {max(self.tcp_rtt_list):.2f}ms",
+            ]
+        if self.tcp_lost_list:
+            total_lost = sum(self.tcp_lost_list)
+            if total_lost > 0:
+                lines += [
+                    f"    Total lost packets: {total_lost}",
+                ]
+        
         lines.append("=" * 55)
         return "\n".join(lines)
 
@@ -172,6 +209,37 @@ def apply_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
 
 
+def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[int]]:
+    """
+    Retrieve TCP socket statistics (Linux only).
+    Returns: (retransmits, rtt_ms, lost_packets)
+    """
+    system = platform.system()
+    if system != "Linux":
+        return (None, None, None)
+    
+    try:
+        # TCP_INFO socket option (Linux-specific)
+        TCP_INFO = 11
+        
+        # Get TCP_INFO structure
+        tcp_info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
+        
+        # Parse relevant fields from tcp_info structure
+        import struct
+        
+        retransmits = struct.unpack_from('B', tcp_info, 5)[0]
+        rtt_us = struct.unpack_from('I', tcp_info, 32)[0]
+        lost = struct.unpack_from('I', tcp_info, 72)[0]
+        
+        # Convert microseconds to milliseconds
+        rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
+        
+        return (retransmits, rtt_ms, lost)
+    except Exception:
+        return (None, None, None)
+
+
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
                              header: bytes, file_data: bytes, size: int,
                              stats: Stats):
@@ -202,6 +270,9 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         response = await asyncio.wait_for(reader.readline(), timeout=30)
         response_str = response.decode(errors="replace").strip()
 
+        # Collect TCP statistics before closing
+        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
+        
         writer.close()
         try:
             await writer.wait_closed()
@@ -210,12 +281,19 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         if response_str == "OK":
-            print(
+            msg = (
                 f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
                 f"total={elapsed_ms:.0f}ms {size}B | checksum=PASS"
             )
+            if tcp_retx is not None:
+                msg += f" | retx={tcp_retx}"
+                if tcp_rtt is not None:
+                    msg += f" rtt={tcp_rtt:.1f}ms"
+            print(msg)
             result = ConnectionResult(conn_id=conn_id, success=True,
-                                      latency_ms=latency_ms, packets_sent=1)
+                                      latency_ms=latency_ms, packets_sent=1,
+                                      tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
+                                      tcp_lost_packets=tcp_lost)
         else:
             print(
                 f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
@@ -272,6 +350,9 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             if duration > 0:
                 await asyncio.sleep(duration)
 
+        # Collect TCP statistics before closing
+        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
+        
         writer.close()
         try:
             await writer.wait_closed()
@@ -279,7 +360,9 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             pass
 
         result = ConnectionResult(conn_id=conn_id, success=True,
-                                  latency_ms=latency_ms, packets_sent=packets_sent)
+                                  latency_ms=latency_ms, packets_sent=packets_sent,
+                                  tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
+                                  tcp_lost_packets=tcp_lost)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         print(f"[{conn_id:>6}] TCP FAILED     | {e}")
@@ -307,20 +390,28 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
             deadline = time.monotonic() + duration
+            seq_num = 0
             while time.monotonic() < deadline:
-                transport.sendto(payload)
+                # Prepend sequence number (4 bytes, network byte order) to payload
+                import struct
+                packet = struct.pack('!I', seq_num) + payload
+                transport.sendto(packet)
                 packets_sent += 1
+                seq_num += 1
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval, remaining))
             timestamp = _format_timestamp()
-            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)}B each")
+            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)+4}B each")
         else:
-            transport.sendto(payload)
+            # Single packet with sequence number 0
+            import struct
+            packet = struct.pack('!I', 0) + payload
+            transport.sendto(packet)
             packets_sent = 1
             timestamp = _format_timestamp()
-            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(payload)}B")
+            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(packet)}B")
             if duration > 0:
                 await asyncio.sleep(duration)
 
