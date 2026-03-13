@@ -28,6 +28,19 @@ _FILE_HEADER_PREFIX = b"TGEN_FILE:"
 _FILE_HEADER_LEN = len(_FILE_HEADER_PREFIX) + 64 + 1 + 10 + 1  # 86 bytes
 _SERVER_MAX_FILE_SIZE = 128 * 1024 * 1024  # 128 MiB — matches client limit
 
+# Global flag for quiet mode
+_QUIET_MODE = False
+_OUTPUT_FILE = None
+
+
+def _log_connection(message: str):
+    """Log connection messages respecting quiet mode and output file."""
+    if _OUTPUT_FILE:
+        _OUTPUT_FILE.write(message + "\n")
+        _OUTPUT_FILE.flush()
+    if not _QUIET_MODE:
+        print(message)
+
 
 class Tee:
     def __init__(self, filename):
@@ -457,7 +470,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
 
     rec = await stats.new_connection(addr_str)
     timestamp = _format_timestamp()
-    print(f"[{timestamp}] [{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
+    _log_connection(f"[{timestamp}] [{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
 
     try:
         # buffer enough bytes to determine if it's a file header
@@ -508,7 +521,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
                 disconnect_msg += f" rtt={rec.tcp_rtt_ms:.1f}ms"
             if rec.tcp_lost_packets is not None and rec.tcp_lost_packets > 0:
                 disconnect_msg += f" lost={rec.tcp_lost_packets}"
-        print(disconnect_msg)
+        _log_connection(disconnect_msg)
         
         try:
             writer.close()
@@ -519,7 +532,14 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
 
 async def run_tcp_server(host: str, port: int, stats: ServerStats):
     async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        await handle_tcp_client(r, w, stats)
+        try:
+            await handle_tcp_client(r, w, stats)
+        except Exception as e:
+            # Catch any unhandled exceptions to prevent them from propagating
+            # to asyncio's internal error handler
+            addr = w.get_extra_info("peername")
+            addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
+            print(f"Error handling TCP client {addr_str}: {e}")
 
     server = await asyncio.start_server(
         handler,
@@ -559,7 +579,7 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             rec = self.stats.new_connection_sync(addr_str)
             self._sessions[addr] = rec
             timestamp = _format_timestamp()
-            print(f"[{timestamp}] [{rec.conn_id:>6}] UDP new sender | {addr_str}")
+            _log_connection(f"[{timestamp}] [{rec.conn_id:>6}] UDP new sender | {addr_str}")
 
         rec = self._sessions[addr]
         rec.bytes_received += len(data)
@@ -671,6 +691,7 @@ OPTIONS
   --port PORT           Port to listen on (required)
   --protocol {tcp,udp}  Protocol to use (default: tcp)
   --output PATH         Optional file path to log the output results
+  --quiet               Suppress per-connection messages (still written to output file)
   -h, --help            Show this help message and exit
 
 NOTES
@@ -706,14 +727,23 @@ EXAMPLES
                         help="Protocol to use: tcp or udp (default: tcp)")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress per-connection messages (still written to output file)")
     return parser.parse_args()
 
 
 def main():
+    global _QUIET_MODE, _OUTPUT_FILE
     args = parse_args()
+    
+    # Set quiet mode globally
+    _QUIET_MODE = args.quiet
     
     if args.output:
         try:
+            _OUTPUT_FILE = open(args.output, "a")
+            atexit.register(lambda: _OUTPUT_FILE.close() if _OUTPUT_FILE and not _OUTPUT_FILE.closed else None)
+            # Also tee regular output to the file
             sys.stdout = Tee(args.output)
         except Exception as e:
             print(f"Error opening output file: {e}", file=sys.stderr)
