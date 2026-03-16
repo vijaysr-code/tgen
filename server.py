@@ -8,7 +8,9 @@ import asyncio
 import argparse
 import atexit
 import hashlib
+import os
 import platform
+import resource
 import signal
 import socket
 import sys
@@ -732,9 +734,50 @@ EXAMPLES
     return parser.parse_args()
 
 
+def check_and_set_ulimit():
+    """
+    Check and adjust ulimit (open files) on Linux if needed.
+    Target: 4194304 (4M) open files for high-performance server.
+    """
+    if platform.system() != "Linux":
+        return
+    
+    try:
+        # Get current soft and hard limits
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target_limit = 4194304
+        
+        if soft_limit < target_limit:
+            # Try to set to target, but don't exceed hard limit
+            new_limit = min(target_limit, hard_limit)
+            
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_limit, hard_limit))
+                print(f"Adjusted ulimit from {soft_limit} to {new_limit} open files")
+            except (ValueError, OSError) as e:
+                # If we can't set to target, try to set to hard limit
+                if new_limit != hard_limit:
+                    try:
+                        resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
+                        print(f"Adjusted ulimit from {soft_limit} to {hard_limit} open files (max available)")
+                    except (ValueError, OSError):
+                        print(f"Warning: Could not adjust ulimit (current: {soft_limit}, target: {target_limit})", file=sys.stderr)
+                        print(f"Consider running: ulimit -n {target_limit}", file=sys.stderr)
+                else:
+                    print(f"Warning: Could not adjust ulimit (current: {soft_limit}, target: {target_limit})", file=sys.stderr)
+                    print(f"Consider running: ulimit -n {target_limit}", file=sys.stderr)
+        else:
+            print(f"ulimit already sufficient: {soft_limit} open files")
+    except Exception as e:
+        print(f"Warning: Could not check ulimit: {e}", file=sys.stderr)
+
+
 def main():
     global _QUIET_MODE, _OUTPUT_FILE
     args = parse_args()
+    
+    # Check and adjust ulimit on Linux
+    check_and_set_ulimit()
     
     # Set quiet mode globally
     _QUIET_MODE = args.quiet
