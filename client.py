@@ -250,7 +250,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
     result: Optional[ConnectionResult] = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=10
+            asyncio.open_connection(host, port), timeout=30
         )
         sock = writer.get_extra_info("socket")
         if sock is not None:
@@ -321,7 +321,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     result: Optional[ConnectionResult] = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=10
+            asyncio.open_connection(host, port), timeout=30
         )
 
         # Apply TCP keepalive always
