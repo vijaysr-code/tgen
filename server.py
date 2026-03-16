@@ -546,7 +546,8 @@ async def run_tcp_server(host: str, port: int, stats: ServerStats):
     server = await asyncio.start_server(
         handler,
         host, port,
-        backlog=65535  # Increase from default 100 to handle high connection rates
+        backlog=65535,  # Increase from default 100 to handle high connection rates
+        reuse_port=True  # Allow multiple server instances on same port (Linux 3.9+)
     )
     addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
     print(f"TCP server listening on {addrs}")
