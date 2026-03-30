@@ -189,9 +189,20 @@ _KA_INTERVAL = 10  # seconds between probes
 _KA_COUNT = 5      # unacked probes before dropping
 
 
-def apply_keepalive(sock: socket.socket) -> None:
-    """Enable TCP keepalive with fixed 10s idle/interval settings."""
+def apply_tcp_optimizations(sock: socket.socket) -> None:
+    """Apply TCP optimizations: keepalive, nodelay, and buffer sizes."""
+    # Enable TCP keepalive
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    
+    # Disable Nagle's algorithm for lower latency (TCP_NODELAY)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    
+    # Increase socket buffers for high throughput (256KB)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+    except OSError:
+        pass  # Ignore if system doesn't allow buffer size changes
 
     system = platform.system()
     if system == "Linux":
@@ -208,6 +219,11 @@ def apply_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
         if hasattr(socket, "TCP_KEEPCNT"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+
+
+def apply_keepalive(sock: socket.socket) -> None:
+    """Deprecated: Use apply_tcp_optimizations() instead."""
+    apply_tcp_optimizations(sock)
 
 
 def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[int]]:
@@ -254,7 +270,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         )
         sock = writer.get_extra_info("socket")
         if sock is not None:
-            apply_keepalive(sock)
+            apply_tcp_optimizations(sock)
 
         latency_ms = (time.monotonic() - t0) * 1000
 
@@ -324,10 +340,10 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             asyncio.open_connection(host, port), timeout=30
         )
 
-        # Apply TCP keepalive always
+        # Apply TCP optimizations (keepalive, nodelay, buffers)
         sock = writer.get_extra_info("socket")
         if sock is not None:
-            apply_keepalive(sock)
+            apply_tcp_optimizations(sock)
 
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -477,7 +493,8 @@ async def run_client(args):
     
     # Batch size for task creation: create multiple tasks before yielding to event loop
     # This reduces context switching overhead when CPS is high
-    batch_size = max(1, min(10, int(args.cps / 10)))  # 10% of CPS, capped at 10
+    # Scale batch size with CPS: 1% of CPS, min 1, max 100
+    batch_size = max(1, min(100, int(args.cps / 100)))
     
     try:
         while args.total == 0 or conn_id < args.total:

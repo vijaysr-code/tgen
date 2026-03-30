@@ -293,9 +293,20 @@ _KA_INTERVAL = 10  # seconds between probes
 _KA_COUNT = 5      # unacked probes before dropping
 
 
-def apply_keepalive(sock: socket.socket) -> None:
-    """Enable TCP keepalive with fixed 10s idle/interval settings."""
+def apply_tcp_optimizations(sock: socket.socket) -> None:
+    """Apply TCP optimizations: keepalive, nodelay, and buffer sizes."""
+    # Enable TCP keepalive
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    
+    # Disable Nagle's algorithm for lower latency (TCP_NODELAY)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    
+    # Increase socket buffers for high throughput (256KB)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+    except OSError:
+        pass  # Ignore if system doesn't allow buffer size changes
 
     system = platform.system()
     if system == "Linux":
@@ -312,6 +323,11 @@ def apply_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
         if hasattr(socket, "TCP_KEEPCNT"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+
+
+def apply_keepalive(sock: socket.socket) -> None:
+    """Deprecated: Use apply_tcp_optimizations() instead."""
+    apply_tcp_optimizations(sock)
 
 
 def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[float],
@@ -465,10 +481,10 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     addr = writer.get_extra_info("peername")
     addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
 
-    # Always apply keepalive on accepted TCP sockets
+    # Always apply TCP optimizations on accepted TCP sockets
     sock = writer.get_extra_info("socket")
     if sock is not None:
-        apply_keepalive(sock)
+        apply_tcp_optimizations(sock)
 
     rec = await stats.new_connection(addr_str)
     timestamp = _format_timestamp()
@@ -643,6 +659,7 @@ async def run_udp_server(host: str, port: int, stats: ServerStats):
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: UDPServerProtocol(stats),
         local_addr=(host, port),
+        reuse_port=True  # Allow multiple server instances on same port (Linux 3.9+)
     )
     print(f"UDP server listening on {host}:{port}")
     try:
