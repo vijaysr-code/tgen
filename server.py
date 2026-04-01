@@ -557,7 +557,8 @@ async def run_tcp_server(host: str, port: int, stats: ServerStats):
             # to asyncio's internal error handler
             addr = w.get_extra_info("peername")
             addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
-            print(f"Error handling TCP client {addr_str}: {e}")
+            timestamp = _format_timestamp()
+            print(f"[{timestamp}] Error handling TCP client {addr_str}: {e}")
 
     server = await asyncio.start_server(
         handler,
@@ -651,7 +652,8 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             print(msg)
 
     def error_received(self, exc):
-        print(f"UDP error: {exc}", file=sys.stderr)
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] UDP error: {exc}", file=sys.stderr)
 
 
 async def run_udp_server(host: str, port: int, stats: ServerStats):
