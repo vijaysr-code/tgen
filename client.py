@@ -322,7 +322,8 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                                       error=f"checksum mismatch: {response_str}")
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
-        print(f"[{conn_id:>6}] TCP file FAILED | {e}")
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
     if result is not None:
@@ -383,7 +384,8 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   tcp_lost_packets=tcp_lost)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
-        print(f"[{conn_id:>6}] TCP FAILED     | {e}")
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
     if result is not None:
@@ -440,7 +442,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | {e}")
+        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=str(e))
     finally:

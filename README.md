@@ -11,6 +11,7 @@ A Python CLI tool for generating and receiving TCP/UDP traffic with configurable
 - **Keepalive Support**: Automatic TCP keepalive configuration
 - **High Performance**: Supports thousands of connections per second
 - **Multicore Support**: 8-16x performance improvement using multiprocessing
+- **Real-Time Dashboard**: Web-based monitoring with live metrics and charts
 
 ## Files
 
@@ -20,6 +21,9 @@ A Python CLI tool for generating and receiving TCP/UDP traffic with configurable
 | `server.py` | Traffic receiver — collects per-connection statistics |
 | `client_multiprocess.py` | Multi-process client for 8-16x performance improvement |
 | `server_multiprocess.py` | Multi-process server with SO_REUSEPORT load balancing |
+| `dashboard.py` | Real-time web dashboard for monitoring server/client metrics |
+| `metrics_reporter.py` | Metrics collection and reporting module for dashboard integration |
+| `DASHBOARD.md` | Complete dashboard documentation and usage guide |
 | `MULTICORE_PERFORMANCE.md` | Detailed guide on multicore optimization strategies |
 | `TCP_STATISTICS.md` | Detailed documentation on TCP statistics collection |
 | `test_tcp_stats.sh` | Test script for verifying TCP statistics functionality |
@@ -217,5 +221,60 @@ python server_multiprocess.py --port 9000 --processes 8
 ```bash
 python client_multiprocess.py --port 9000 --cps 100000 --total 1000000 --processes 8
 ```
+
+
+---
+
+## Real-Time Dashboard
+
+Monitor server and client metrics in real-time with the web-based dashboard.
+
+### Quick Start
+
+**1. Install dependencies:**
+```bash
+pip install aiohttp
+```
+
+**2. Start the dashboard:**
+```bash
+python3 dashboard.py
+```
+
+Dashboard will be available at: **http://localhost:8080**
+
+**3. Run server with dashboard integration:**
+```bash
+python3 server_multiprocess.py --port 9000 --processes 4 --dashboard http://localhost:8081
+```
+
+**4. Run client with dashboard integration:**
+```bash
+python3 client_multiprocess.py --port 9000 --cps 10000 --total 100000 --processes 4 --dashboard http://localhost:8081
+```
+
+### Dashboard Features
+
+- **Real-time metrics**: Live updates via WebSocket
+- **Server monitoring**: Connection counts, throughput, bytes transferred
+- **Client monitoring**: Success rates, latency statistics, connection rates
+- **Interactive charts**: Connection rate and latency graphs
+- **Multi-process support**: Aggregates metrics from all worker processes
+
+### Dashboard Metrics
+
+**Server Metrics:**
+- Total/Active connections
+- Connections per second
+- Bytes received/sent
+- Protocol and port info
+
+**Client Metrics:**
+- Total/Successful/Failed connections
+- Connections per second
+- Average/Min/Max latency
+- Packets sent
+
+For complete dashboard documentation, see [`DASHBOARD.md`](DASHBOARD.md).
 
 For detailed optimization strategies and system tuning recommendations, see [`MULTICORE_PERFORMANCE.md`](MULTICORE_PERFORMANCE.md).
