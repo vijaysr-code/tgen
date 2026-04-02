@@ -100,9 +100,26 @@ def run_multiprocess_server(args, num_processes: Optional[int] = None, use_affin
         print(f"\nWarning: Only {ready_count}/{num_processes} workers ready.", file=sys.stderr)
     
     # Wait for all processes
+    # Server processes should run indefinitely until interrupted
     try:
-        for p in processes:
-            p.join()
+        # Monitor worker processes and restart if they crash
+        while True:
+            # Check if any worker has died unexpectedly
+            for i, p in enumerate(processes):
+                if not p.is_alive():
+                    exit_code = p.exitcode
+                    if exit_code != 0:  # Non-zero exit = crash
+                        print(f"\nWarning: Worker {i} (PID: {p.pid}) crashed with exit code {exit_code}",
+                              file=sys.stderr)
+                        print(f"Restarting worker {i}...", file=sys.stderr)
+                        # Restart the crashed worker
+                        new_p = mp.Process(target=worker_server, args=(i, args, ready_queue, use_affinity))
+                        new_p.start()
+                        processes[i] = new_p
+                        print(f"Worker {i} restarted (PID: {new_p.pid})")
+            
+            # Sleep briefly before next check
+            time.sleep(1.0)
     except KeyboardInterrupt:
         print("\n\nShutting down all server workers...")
         # Send SIGINT to all workers for graceful shutdown

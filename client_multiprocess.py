@@ -202,9 +202,45 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
     
     print()
     
-    # Wait for all processes to complete
+    # Wait for all processes to complete with timeout
+    # Calculate reasonable timeout based on workload:
+    # - Connection setup time: total_connections / cps
+    # - Connection duration: args.duration (time each connection stays alive)
+    # - Cleanup buffer: 60s for graceful shutdown
+    # The timeout must be significantly larger than duration to account for:
+    # 1. Time to establish all connections (total/cps)
+    # 2. Time for all connections to complete (duration)
+    # 3. Time for cleanup and result collection
+    if args.total > 0:
+        setup_time = args.total / args.cps if args.cps > 0 else args.total
+        # Timeout = setup + duration + generous buffer (2x duration or min 60s)
+        buffer = max(60.0, args.duration * 2.0)
+        timeout_per_process = setup_time + args.duration + buffer
+    else:
+        # Should not reach here, but provide fallback
+        timeout_per_process = 600.0  # 10 minutes default
+    
+    # Wait for each process with timeout
+    hung_processes = []
     for p in processes:
-        p.join()
+        p.join(timeout=timeout_per_process)
+        if p.is_alive():
+            print(f"Warning: Process {p.pid} did not complete within {timeout_per_process:.0f}s timeout",
+                  file=sys.stderr)
+            hung_processes.append(p)
+    
+    # Terminate any hung processes
+    if hung_processes:
+        print(f"\nTerminating {len(hung_processes)} hung process(es)...", file=sys.stderr)
+        for p in hung_processes:
+            p.terminate()
+        # Give them a moment to terminate gracefully
+        time.sleep(1)
+        # Force kill if still alive
+        for p in hung_processes:
+            if p.is_alive():
+                p.kill()
+                print(f"Force killed process {p.pid}", file=sys.stderr)
     
     # Collect and aggregate results
     all_stats = []
