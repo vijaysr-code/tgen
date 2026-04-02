@@ -206,26 +206,34 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
     # Calculate reasonable timeout based on workload:
     # - Connection setup time: total_connections / cps
     # - Connection duration: args.duration (time each connection stays alive)
-    # - Cleanup buffer: 60s for graceful shutdown
-    # The timeout must be significantly larger than duration to account for:
-    # 1. Time to establish all connections (total/cps)
-    # 2. Time for all connections to complete (duration)
-    # 3. Time for cleanup and result collection
+    # - Cleanup buffer: 60s for graceful shutdown and result collection
+    # Timeout should be just slightly more than expected completion time
     if args.total > 0:
         setup_time = args.total / args.cps if args.cps > 0 else args.total
-        # Timeout = setup + duration + generous buffer (2x duration or min 60s)
-        buffer = max(60.0, args.duration * 2.0)
-        timeout_per_process = setup_time + args.duration + buffer
+        # Timeout = setup + duration + fixed 60s buffer for cleanup
+        # The 60s buffer accounts for:
+        # - asyncio event loop cleanup
+        # - TCP connection teardown
+        # - Result queue operations
+        timeout_per_process = setup_time + args.duration + 60.0
     else:
         # Should not reach here, but provide fallback
         timeout_per_process = 600.0  # 10 minutes default
     
-    # Wait for each process with timeout
+    # Wait for all processes to complete with timeout
+    # Since all processes start at the same time, they should all complete
+    # within the same timeout period. We check them all together.
+    start_wait = time.time()
     hung_processes = []
+    
+    # Check each process, but respect the overall timeout
     for p in processes:
-        p.join(timeout=timeout_per_process)
+        remaining_time = timeout_per_process - (time.time() - start_wait)
+        if remaining_time > 0:
+            p.join(timeout=remaining_time)
+        
         if p.is_alive():
-            print(f"Warning: Process {p.pid} did not complete within {timeout_per_process:.0f}s timeout",
+            print(f"Warning: Process {p.pid} did not complete within timeout",
                   file=sys.stderr)
             hung_processes.append(p)
     
