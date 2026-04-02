@@ -188,6 +188,9 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
     
     # Spawn worker processes
     processes = []
+    start_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"[{start_timestamp}] Starting {num_processes} worker processes...")
+    
     for i in range(num_processes):
         # Distribute remainder connections to first few processes
         worker_connections = connections_per_process + (1 if i < remainder else 0)
@@ -239,7 +242,8 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
     
     # Terminate any hung processes
     if hung_processes:
-        print(f"\nTerminating {len(hung_processes)} hung process(es)...", file=sys.stderr)
+        terminate_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"\n[{terminate_timestamp}] Terminating {len(hung_processes)} hung process(es)...", file=sys.stderr)
         for p in hung_processes:
             p.terminate()
         # Give them a moment to terminate gracefully
@@ -248,7 +252,8 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
         for p in hung_processes:
             if p.is_alive():
                 p.kill()
-                print(f"Force killed process {p.pid}", file=sys.stderr)
+                kill_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                print(f"[{kill_timestamp}] Force killed process {p.pid}", file=sys.stderr)
     
     # Collect and aggregate results
     all_stats = []
