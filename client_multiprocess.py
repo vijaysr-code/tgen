@@ -146,7 +146,7 @@ def worker_process(process_id: int, args, connections_per_process: int,
         result_queue.put(None)
 
 
-def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affinity: bool = False):
+def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affinity: bool = False, stats_interval: float = 30.0):
     """
     Main function to coordinate multiple worker processes
     
@@ -154,6 +154,7 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
         args: Parsed command-line arguments
         num_processes: Number of processes to spawn (default: CPU count)
         use_affinity: Pin each process to a specific CPU core (Linux only)
+        stats_interval: Interval in seconds to print intermediate stats (0 = disabled)
     """
     if num_processes is None:
         num_processes = mp.cpu_count()
@@ -224,26 +225,84 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
         timeout_per_process = 600.0  # 10 minutes default
     
     # Wait for all processes to complete with timeout
-    # Since all processes start at the same time, they should all complete
-    # within the same timeout period. We check them all together.
+    # Periodically collect and print stats if stats_interval > 0
     start_wait = time.time()
+    last_stats_time = start_wait
     hung_processes = []
+    all_stats = []
+    collected_worker_ids = set()  # Track which workers have reported stats
     
-    # Check each process, but respect the overall timeout
-    for p in processes:
-        remaining_time = timeout_per_process - (time.time() - start_wait)
-        if remaining_time > 0:
-            p.join(timeout=remaining_time)
+    if stats_interval > 0:
+        print(f"\nMonitoring processes (stats every {stats_interval}s)...\n")
+    
+    # Poll processes until all complete or timeout
+    while True:
+        current_time = time.time()
+        elapsed = current_time - start_wait
         
-        if p.is_alive():
-            print(f"Warning: Process {p.pid} did not complete within timeout",
-                  file=sys.stderr)
-            hung_processes.append(p)
+        # Check if we've exceeded timeout
+        if elapsed >= timeout_per_process:
+            # Mark any still-alive processes as hung
+            for p in processes:
+                if p.is_alive():
+                    print(f"Warning: Process {p.pid} did not complete within timeout",
+                          file=sys.stderr)
+                    hung_processes.append(p)
+            break
+        
+        # Check if all processes have completed
+        all_done = all(not p.is_alive() for p in processes)
+        if all_done:
+            break
+        
+        # Collect stats from queue periodically
+        if stats_interval > 0 and (current_time - last_stats_time) >= stats_interval:
+            stats_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            print(f"\n[{stats_timestamp}] Progress Report (elapsed: {elapsed:.1f}s / timeout: {timeout_per_process:.1f}s)")
+            
+            # Collect any available stats from queue (avoid duplicates)
+            temp_stats = []
+            while not result_queue.empty():
+                stat = result_queue.get()
+                if stat and stat.process_id not in collected_worker_ids:
+                    temp_stats.append(stat)
+                    all_stats.append(stat)
+                    collected_worker_ids.add(stat.process_id)
+            
+            # Show completed workers
+            if temp_stats:
+                print(f"  Completed workers since last check:")
+                for s in temp_stats:
+                    print(f"    Worker {s.process_id}: {s.success}/{s.total} successful, "
+                          f"{s.total_packets} packets, {s.elapsed:.1f}s elapsed")
+            
+            # Show status of workers that haven't reported yet
+            completed = len(collected_worker_ids)
+            running = sum(1 for p in processes if p.is_alive())
+            unreported = num_processes - completed
+            
+            print(f"  Status: {completed}/{num_processes} workers completed, {running} still running")
+            
+            if unreported > 0 and args.total > 0:
+                # Show expected progress for running workers
+                expected_setup_time = connections_per_process / args.cps if args.cps > 0 else 0
+                expected_total_time = expected_setup_time + args.duration
+                progress_pct = min(100, (elapsed / expected_total_time) * 100) if expected_total_time > 0 else 0
+                print(f"  Expected: ~{connections_per_process} connections/worker, "
+                      f"~{expected_total_time:.1f}s total time")
+                print(f"  Progress: ~{progress_pct:.0f}% of expected time elapsed")
+            
+            last_stats_time = current_time
+        
+        # Sleep briefly before next check
+        time.sleep(0.5)
     
     # Terminate any hung processes
     if hung_processes:
         terminate_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         print(f"\n[{terminate_timestamp}] Terminating {len(hung_processes)} hung process(es)...", file=sys.stderr)
+        print(f"  Note: Stats from terminated processes will NOT be available", file=sys.stderr)
+        print(f"        Workers only report stats upon completion, not during execution", file=sys.stderr)
         for p in hung_processes:
             p.terminate()
         # Give them a moment to terminate gracefully
@@ -255,12 +314,12 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
                 kill_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 print(f"[{kill_timestamp}] Force killed process {p.pid}", file=sys.stderr)
     
-    # Collect and aggregate results
-    all_stats = []
+    # Collect any remaining stats from queue (avoid duplicates)
     while not result_queue.empty():
         stat = result_queue.get()
-        if stat:
+        if stat and stat.process_id not in collected_worker_ids:
             all_stats.append(stat)
+            collected_worker_ids.add(stat.process_id)
     
     # Print aggregated summary
     print_aggregated_summary(all_stats, num_processes)
@@ -363,6 +422,7 @@ OPTIONS
   --output PATH         Optional file path to log the output results
   --processes N         Number of worker processes (default: CPU count)
   --cpu-affinity        Pin each worker process to a specific CPU core (Linux only)
+  --stats-interval SECS Print intermediate stats every N seconds; 0 = disabled (default: 30)
   -h, --help            Show this help message and exit
 
 NOTES
@@ -432,6 +492,8 @@ PERFORMANCE
                         help="Number of worker processes (default: CPU count)")
     parser.add_argument("--cpu-affinity", action="store_true",
                         help="Pin each worker process to a specific CPU core (Linux only)")
+    parser.add_argument("--stats-interval", type=float, default=30.0,
+                        help="Print intermediate stats every N seconds; 0 = disabled (default: 30)")
     return parser.parse_args()
 
 
@@ -458,6 +520,9 @@ def main():
     if args.processes is not None and args.processes < 1:
         print("Error: --processes must be >= 1", file=sys.stderr)
         sys.exit(1)
+    if args.stats_interval < 0:
+        print("Error: --stats-interval must be >= 0", file=sys.stderr)
+        sys.exit(1)
     
     # Validate file if specified
     if args.file:
@@ -470,7 +535,7 @@ def main():
     
     # Run multi-process client
     try:
-        run_multiprocess_client(args, args.processes)
+        run_multiprocess_client(args, args.processes, args.cpu_affinity, args.stats_interval)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
 
