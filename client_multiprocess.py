@@ -540,6 +540,15 @@ def main():
     # Check and adjust ulimit on Linux
     check_and_set_ulimit()
     
+    # Set up output file if specified
+    if args.output:
+        try:
+            from client import Tee
+            sys.stdout = Tee(args.output)
+        except Exception as e:
+            print(f"Error opening output file: {e}", file=sys.stderr)
+            sys.exit(1)
+    
     # Validate arguments
     if args.cps <= 0:
         print("Error: --cps must be > 0", file=sys.stderr)

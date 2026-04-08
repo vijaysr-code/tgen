@@ -7,6 +7,7 @@ Provides 8-16x performance improvement on multicore systems
 
 import asyncio
 import argparse
+import atexit
 import multiprocessing as mp
 import os
 import platform
@@ -16,8 +17,9 @@ import sys
 import time
 from typing import Optional
 
-# Import existing server functions
+# Import existing server functions and module for global access
 from server import run_server, parse_args as server_parse_args
+import server
 
 
 def worker_server(process_id: int, args, ready_queue: mp.Queue, use_affinity: bool = False):
@@ -25,6 +27,20 @@ def worker_server(process_id: int, args, ready_queue: mp.Queue, use_affinity: bo
     Worker process running its own server instance
     SO_REUSEPORT allows multiple processes to bind to same port
     """
+    # Initialize output file and quiet mode for this worker process
+    # Each worker needs to set these globals in its own process space
+    server._QUIET_MODE = args.quiet if hasattr(args, 'quiet') else False
+    
+    if hasattr(args, 'output') and args.output:
+        try:
+            # Each worker appends to the same output file
+            output_file = open(args.output, "a")
+            server._OUTPUT_FILE = output_file
+            # Register cleanup for this worker process
+            atexit.register(lambda: output_file.close() if output_file and not output_file.closed else None)
+        except Exception as e:
+            print(f"Worker {process_id} error opening output file: {e}", file=sys.stderr)
+    
     # Set CPU affinity if requested (Linux only)
     if use_affinity and hasattr(os, 'sched_setaffinity'):
         try:
