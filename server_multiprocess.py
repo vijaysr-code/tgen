@@ -9,6 +9,8 @@ import asyncio
 import argparse
 import multiprocessing as mp
 import os
+import platform
+import resource
 import signal
 import sys
 import time
@@ -45,6 +47,41 @@ def worker_server(process_id: int, args, ready_queue: mp.Queue, use_affinity: bo
         pass
     except Exception as e:
         print(f"Worker {process_id} error: {e}", file=sys.stderr)
+
+
+def check_and_set_ulimit():
+    """
+    Check and adjust ulimit (open files) on Linux if needed.
+    Target: 4194304 (4M) open files for high-performance server.
+    """
+    if platform.system() != "Linux":
+        return
+    
+    try:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target_limit = 4194304
+        
+        if soft_limit < target_limit:
+            new_limit = min(target_limit, hard_limit)
+            
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_limit, hard_limit))
+                print(f"Adjusted ulimit from {soft_limit} to {new_limit} open files")
+            except (ValueError, OSError):
+                if new_limit != hard_limit:
+                    try:
+                        resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
+                        print(f"Adjusted ulimit from {soft_limit} to {hard_limit} open files (max available)")
+                    except (ValueError, OSError):
+                        print(f"Warning: Could not adjust ulimit (current: {soft_limit}, target: {target_limit})", file=sys.stderr)
+                        print(f"Consider running: ulimit -n {target_limit}", file=sys.stderr)
+                else:
+                    print(f"Warning: Could not adjust ulimit (current: {soft_limit}, target: {target_limit})", file=sys.stderr)
+                    print(f"Consider running: ulimit -n {target_limit}", file=sys.stderr)
+        else:
+            print(f"ulimit already sufficient: {soft_limit} open files")
+    except Exception as e:
+        print(f"Warning: Could not check ulimit: {e}", file=sys.stderr)
 
 
 def run_multiprocess_server(args, num_processes: Optional[int] = None, use_affinity: bool = False):
@@ -221,6 +258,9 @@ PERFORMANCE
 
 def main():
     args = parse_args()
+    
+    # Check and adjust ulimit on Linux
+    check_and_set_ulimit()
     
     # Validate process count
     if args.processes is not None and args.processes < 1:

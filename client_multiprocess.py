@@ -9,6 +9,8 @@ import asyncio
 import argparse
 import multiprocessing as mp
 import os
+import platform
+import resource
 import sys
 import time
 from dataclasses import dataclass
@@ -146,6 +148,41 @@ def worker_process(process_id: int, args, connections_per_process: int,
         result_queue.put(None)
 
 
+def check_and_set_ulimit():
+    """
+    Check and adjust ulimit (open files) on Linux if needed.
+    Target: 1048576 (1M) open files for high-performance client.
+    """
+    if platform.system() != "Linux":
+        return
+    
+    try:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target_limit = 1048576
+        
+        if soft_limit < target_limit:
+            new_limit = min(target_limit, hard_limit)
+            
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_limit, hard_limit))
+                print(f"Adjusted ulimit from {soft_limit} to {new_limit} open files")
+            except (ValueError, OSError):
+                if new_limit != hard_limit:
+                    try:
+                        resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
+                        print(f"Adjusted ulimit from {soft_limit} to {hard_limit} open files (max available)")
+                    except (ValueError, OSError):
+                        print(f"Warning: Could not adjust ulimit (current: {soft_limit}, target: {target_limit})", file=sys.stderr)
+                        print(f"Consider running: ulimit -n {target_limit}", file=sys.stderr)
+                else:
+                    print(f"Warning: Could not adjust ulimit (current: {soft_limit}, target: {target_limit})", file=sys.stderr)
+                    print(f"Consider running: ulimit -n {target_limit}", file=sys.stderr)
+        else:
+            print(f"ulimit already sufficient: {soft_limit} open files")
+    except Exception as e:
+        print(f"Warning: Could not check ulimit: {e}", file=sys.stderr)
+
+
 def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affinity: bool = False, stats_interval: float = 30.0):
     """
     Main function to coordinate multiple worker processes
@@ -210,16 +247,16 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
     # Calculate reasonable timeout based on workload:
     # - Connection setup time: total_connections / cps
     # - Connection duration: args.duration (time each connection stays alive)
-    # - Cleanup buffer: 60s for graceful shutdown and result collection
-    # Timeout should be just slightly more than expected completion time
+    # - Cleanup buffer: default 2 minutes, plus 1 extra minute for every
+    #   additional 5K connections because teardown can take longer at scale
     if args.total > 0:
         setup_time = args.total / args.cps if args.cps > 0 else args.total
-        # Timeout = setup + duration + fixed 60s buffer for cleanup
-        # The 60s buffer accounts for:
-        # - asyncio event loop cleanup
-        # - TCP connection teardown
-        # - Result queue operations
-        timeout_per_process = setup_time + args.duration + 60.0
+        
+        base_cleanup_buffer = 120.0  # 2 minutes default
+        additional_connection_blocks = args.total // 5000
+        cleanup_buffer = base_cleanup_buffer + (additional_connection_blocks * 60.0)
+        
+        timeout_per_process = setup_time + args.duration + cleanup_buffer
     else:
         # Should not reach here, but provide fallback
         timeout_per_process = 600.0  # 10 minutes default
@@ -499,6 +536,9 @@ PERFORMANCE
 
 def main():
     args = parse_args()
+    
+    # Check and adjust ulimit on Linux
+    check_and_set_ulimit()
     
     # Validate arguments
     if args.cps <= 0:
