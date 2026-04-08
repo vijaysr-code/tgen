@@ -66,7 +66,7 @@ class Tee:
 
     def flush(self):
         self.stdout.flush()
-        if self.file:
+        if self.file and not self.file.closed:
             self.file.flush()
 
     def close(self):
