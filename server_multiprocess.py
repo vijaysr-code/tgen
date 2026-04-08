@@ -278,6 +278,17 @@ def main():
     # Check and adjust ulimit on Linux
     check_and_set_ulimit()
     
+    # Set up output file for main process messages if specified
+    output_file = None
+    if args.output:
+        try:
+            from server import Tee
+            sys.stdout = Tee(args.output)
+            output_file = sys.stdout.file if hasattr(sys.stdout, 'file') else None
+        except Exception as e:
+            print(f"Error opening output file: {e}", file=sys.stderr)
+            sys.exit(1)
+    
     # Validate process count
     if args.processes is not None and args.processes < 1:
         print("Error: --processes must be >= 1", file=sys.stderr)

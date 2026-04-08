@@ -63,7 +63,7 @@ class Tee:
 
     def flush(self):
         self.stdout.flush()
-        if self.file:
+        if self.file and not self.file.closed:
             self.file.flush()
 
     def close(self):
@@ -685,8 +685,20 @@ async def run_server(args):
     loop = asyncio.get_running_loop()
 
     def shutdown(*_):
-        print("\nShutting down...")
-        print(stats.summary())
+        shutdown_msg = "\nShutting down..."
+        summary_output = stats.summary()
+        
+        # Write to output file if configured
+        if _OUTPUT_FILE:
+            _OUTPUT_FILE.write(shutdown_msg + "\n")
+            _OUTPUT_FILE.write(summary_output + "\n")
+            _OUTPUT_FILE.flush()
+        
+        # Print to console unless in quiet mode
+        if not _QUIET_MODE:
+            print(shutdown_msg)
+            print(summary_output)
+        
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
