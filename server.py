@@ -490,6 +490,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     timestamp = _format_timestamp()
     _log_connection(f"[{timestamp}] [{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
 
+    disconnect_reason = "normal"  # Track disconnect reason
     try:
         # buffer enough bytes to determine if it's a file header
         prefix_len = len(_FILE_HEADER_PREFIX)
@@ -516,8 +517,23 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
                     break
                 rec.bytes_received += len(data)
                 rec.messages_received += 1
-    except (asyncio.IncompleteReadError, ConnectionResetError):
-        pass
+    except ConnectionResetError:
+        disconnect_reason = "RST"
+    except ConnectionAbortedError:
+        disconnect_reason = "aborted"
+    except BrokenPipeError:
+        disconnect_reason = "broken_pipe"
+    except asyncio.IncompleteReadError:
+        disconnect_reason = "incomplete"
+    except OSError as e:
+        # Catch other OS-level socket errors
+        disconnect_reason = f"error:{e.errno}" if hasattr(e, 'errno') else "error"
+    except asyncio.CancelledError:
+        disconnect_reason = "cancelled"
+        raise  # Re-raise to allow proper cleanup
+    except Exception as e:
+        # Catch any unexpected errors
+        disconnect_reason = f"exception:{type(e).__name__}"
     finally:
         # Collect TCP statistics before closing
         if sock is not None:
@@ -528,10 +544,11 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
         dur = rec.duration if rec.duration is not None else 0.0
         timestamp = _format_timestamp()
         
-        # Enhanced disconnect message with TCP stats
+        # Enhanced disconnect message with TCP stats and disconnect reason
+        reason_suffix = f" ({disconnect_reason})" if disconnect_reason != "normal" else ""
         disconnect_msg = (
             f"[{timestamp}] [{rec.conn_id:>6}] TCP disconnect | {addr_str} | "
-            f"dur={dur:.3f}s | {rec.bytes_received}B"
+            f"dur={dur:.3f}s | {rec.bytes_received}B{reason_suffix}"
         )
         if rec.tcp_retransmits is not None:
             disconnect_msg += f" | retx={rec.tcp_retransmits}"
@@ -653,7 +670,27 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
 
     def error_received(self, exc):
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] UDP error: {exc}", file=sys.stderr)
+        # Identify specific UDP error types
+        if isinstance(exc, ConnectionRefusedError):
+            error_detail = "port_unreachable (ICMP)"
+        elif isinstance(exc, OSError):
+            if hasattr(exc, 'errno'):
+                if exc.errno == 111:  # ECONNREFUSED
+                    error_detail = "port_unreachable (ICMP)"
+                elif exc.errno == 101:  # ENETUNREACH
+                    error_detail = "network_unreachable"
+                elif exc.errno == 113:  # EHOSTUNREACH
+                    error_detail = "host_unreachable"
+                elif exc.errno == 90:  # EMSGSIZE
+                    error_detail = "message_too_long"
+                else:
+                    error_detail = f"error:{exc.errno} - {exc}"
+            else:
+                error_detail = str(exc)
+        else:
+            error_detail = f"{type(exc).__name__}: {exc}"
+        
+        print(f"[{timestamp}] UDP error: {error_detail}", file=sys.stderr)
 
 
 async def run_udp_server(host: str, port: int, stats: ServerStats):

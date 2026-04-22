@@ -320,12 +320,50 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
             result = ConnectionResult(conn_id=conn_id, success=False,
                                       latency_ms=latency_ms,
                                       error=f"checksum mismatch: {response_str}")
+    except ConnectionResetError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | RST: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"RST: {e}")
+    except ConnectionRefusedError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | refused: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"refused: {e}")
+    except ConnectionAbortedError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | aborted: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"aborted: {e}")
+    except BrokenPipeError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | broken_pipe: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"broken_pipe: {e}")
+    except asyncio.TimeoutError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | timeout: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"timeout: {e}")
+    except OSError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        error_detail = f"error:{e.errno}" if hasattr(e, 'errno') else str(e)
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | {error_detail}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=error_detail)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | {e}")
+        error_detail = f"{type(e).__name__}: {e}"
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=str(e))
+                                  latency_ms=latency_ms, error=error_detail)
     if result is not None:
         stats.record(result)
 
@@ -382,12 +420,50 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   latency_ms=latency_ms, packets_sent=packets_sent,
                                   tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
                                   tcp_lost_packets=tcp_lost)
+    except ConnectionResetError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | RST: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"RST: {e}")
+    except ConnectionRefusedError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | refused: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"refused: {e}")
+    except ConnectionAbortedError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | aborted: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"aborted: {e}")
+    except BrokenPipeError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | broken_pipe: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"broken_pipe: {e}")
+    except asyncio.TimeoutError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | timeout: {e}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=f"timeout: {e}")
+    except OSError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        error_detail = f"error:{e.errno}" if hasattr(e, 'errno') else str(e)
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=error_detail)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {e}")
+        error_detail = f"{type(e).__name__}: {e}"
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=str(e))
+                                  latency_ms=latency_ms, error=error_detail)
     if result is not None:
         stats.record(result)
 
@@ -439,12 +515,37 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent)
+    except OSError as e:
+        # UDP-specific errors:
+        # ECONNREFUSED (111): ICMP port unreachable received
+        # ENETUNREACH (101): Network unreachable
+        # EHOSTUNREACH (113): Host unreachable
+        # EMSGSIZE (90): Message too long
+        latency_ms = (time.monotonic() - t0) * 1000
+        timestamp = _format_timestamp()
+        if hasattr(e, 'errno'):
+            if e.errno == 111:  # ECONNREFUSED
+                error_detail = "port_unreachable (ICMP)"
+            elif e.errno == 101:  # ENETUNREACH
+                error_detail = "network_unreachable"
+            elif e.errno == 113:  # EHOSTUNREACH
+                error_detail = "host_unreachable"
+            elif e.errno == 90:  # EMSGSIZE
+                error_detail = "message_too_long"
+            else:
+                error_detail = f"error:{e.errno}"
+        else:
+            error_detail = str(e)
+        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
+        result = ConnectionResult(conn_id=conn_id, success=False,
+                                  latency_ms=latency_ms, error=error_detail)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {e}")
+        error_detail = f"{type(e).__name__}: {e}"
+        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=str(e))
+                                  latency_ms=latency_ms, error=error_detail)
     finally:
         if transport is not None:
             transport.close()  # always close, even on exception
