@@ -163,6 +163,29 @@ class Stats:
         return "\n".join(lines)
 
 
+def calculate_timeout(cps: float) -> float:
+    """
+    Calculate connection timeout based on connections per second (CPS).
+    Higher CPS = more server load = need longer timeout to avoid ETIMEDOUT (error 110).
+    
+    Args:
+        cps: Connections per second rate
+    
+    Returns:
+        Timeout in seconds
+    """
+    if cps >= 1000:
+        return 120.0  # Very high rate: 2 minutes
+    elif cps >= 500:
+        return 90.0   # High rate: 1.5 minutes
+    elif cps >= 100:
+        return 60.0   # Medium-high rate: 1 minute
+    elif cps >= 50:
+        return 45.0   # Medium rate: 45 seconds
+    else:
+        return 30.0   # Low rate: 30 seconds (default)
+
+
 def make_payload(args) -> bytes:
     """Build the payload bytes.  File mode is handled separately via make_file_transfer()."""
     if args.payload_size > 0:
@@ -260,13 +283,13 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
                              header: bytes, file_data: bytes, size: int,
-                             stats: Stats):
+                             stats: Stats, timeout: float = 30.0):
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
     result: Optional[ConnectionResult] = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=30
+            asyncio.open_connection(host, port), timeout=timeout
         )
         sock = writer.get_extra_info("socket")
         if sock is not None:
@@ -285,7 +308,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
             await writer.drain()
 
         # Read server response: "OK\n" or "FAIL:<reason>\n"
-        response = await asyncio.wait_for(reader.readline(), timeout=30)
+        response = await asyncio.wait_for(reader.readline(), timeout=timeout)
         response_str = response.decode(errors="replace").strip()
 
         # Collect TCP statistics before closing
@@ -369,14 +392,14 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
 
 
 async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
-                         duration: float, stats: Stats, args=None):
+                         duration: float, stats: Stats, args=None, timeout: float = 30.0):
     t0 = time.monotonic()
     packets_sent = 0
     pps = args.pps if args else 0
     result: Optional[ConnectionResult] = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=30
+            asyncio.open_connection(host, port), timeout=timeout
         )
 
         # Apply TCP optimizations (keepalive, nodelay, buffers)
@@ -558,6 +581,9 @@ async def run_client(args):
     interval = 1.0 / args.cps if args.cps > 0 else 0.0
     conn_id = 0
     tasks = set()
+    
+    # Calculate timeout based on CPS to handle high connection rates
+    connection_timeout = calculate_timeout(args.cps)
 
     # File-transfer mode: load file into memory once (file already validated in main())
     if args.file:
@@ -578,6 +604,7 @@ async def run_client(args):
     print("Starting traffic generator")
     print(f"  Target   : {args.protocol.upper()} {args.host}:{args.port}")
     print(f"  CPS      : {args.cps} conn/s  (interval={interval*1000:.1f}ms)")
+    print(f"  Timeout  : {connection_timeout:.0f}s (scaled for CPS)")
     if file_transfer:
         print(f"  Mode     : file transfer (-F {args.file})")
         print(f"  File size: {file_size} bytes")
@@ -612,10 +639,12 @@ async def run_client(args):
                 if file_transfer:
                     # File-transfer mode: TCP only (UDP is unreliable for integrity checks)
                     coro = tcp_file_transfer(conn_id, args.host, args.port,
-                                             file_header, file_data, file_size, stats)
+                                             file_header, file_data, file_size, stats,
+                                             timeout=connection_timeout)
                 elif args.protocol == "tcp":
                     coro = tcp_connection(conn_id, args.host, args.port, payload,
-                                          args.duration, stats, args)
+                                          args.duration, stats, args,
+                                          timeout=connection_timeout)
                 else:
                     coro = udp_connection(conn_id, args.host, args.port, payload,
                                           args.duration, stats, args)
