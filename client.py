@@ -527,7 +527,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
 
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
-                         duration: float, stats: Stats, args=None):
+                         duration: float, stats: Stats, args=None, dashboard_tracker=None):
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
     packets_sent = 0
@@ -573,6 +573,10 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent)
+        
+        # Update dashboard if enabled
+        if dashboard_tracker:
+            dashboard_tracker.record_connection(True, latency_ms, packets_sent)
     except OSError as e:
         # UDP-specific errors:
         # ECONNREFUSED (111): ICMP port unreachable received
@@ -597,6 +601,10 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
         print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=error_detail)
+        
+        # Update dashboard if enabled
+        if dashboard_tracker:
+            dashboard_tracker.record_connection(False, latency_ms, 0)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -699,10 +707,12 @@ async def run_client(args):
                 elif args.protocol == "tcp":
                     coro = tcp_connection(conn_id, args.host, args.port, payload,
                                           args.duration, stats, args,
-                                          timeout=connection_timeout)
+                                          timeout=connection_timeout,
+                                          dashboard_tracker=dashboard_tracker)
                 else:
                     coro = udp_connection(conn_id, args.host, args.port, payload,
-                                          args.duration, stats, args)
+                                          args.duration, stats, args,
+                                          dashboard_tracker=dashboard_tracker)
 
                 task = asyncio.create_task(coro)
                 tasks.add(task)

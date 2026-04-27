@@ -74,11 +74,9 @@ class MetricsReporter:
             url = f"{self.config.dashboard_url}/metrics/{self.metric_type}"
             async with self.session.post(url, json=metrics, timeout=aiohttp.ClientTimeout(total=2)) as resp:
                 if resp.status != 200:
-                    # Silently fail - don't spam logs
-                    pass
-        except Exception:
-            # Silently fail - metrics reporting shouldn't crash the app
-            pass
+                    print(f"DEBUG: Metrics report failed: HTTP {resp.status} for {self.metric_type}")
+        except Exception as e:
+            print(f"DEBUG: Metrics report exception for {self.metric_type}: {e}")
 
 
 class ServerMetricsTracker:
