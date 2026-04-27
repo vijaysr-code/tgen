@@ -506,6 +506,9 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     # Update dashboard
     if dashboard_tracker:
         dashboard_tracker.record_connection()
+        print(f"DEBUG: Recorded connection. Total={dashboard_tracker.total_connections}, Active={dashboard_tracker.active_connections}")
+    else:
+        print("DEBUG: dashboard_tracker is None!")
 
     disconnect_reason = "normal"  # Track disconnect reason
     try:
@@ -750,6 +753,7 @@ async def run_server(args):
     dashboard_task = None
     
     if hasattr(args, 'dashboard') and args.dashboard and DASHBOARD_AVAILABLE:
+        print(f"DEBUG: Initializing dashboard integration with URL: {args.dashboard}")
         config = MetricsConfig(
             dashboard_url=args.dashboard,
             report_interval=1.0,
@@ -761,9 +765,13 @@ async def run_server(args):
             port=args.port,
             processes=1
         )
+        print(f"DEBUG: dashboard_tracker created: {dashboard_tracker}")
+        print(f"DEBUG: Initial state - Total: {dashboard_tracker.total_connections}, Active: {dashboard_tracker.active_connections}")
         dashboard_task = asyncio.create_task(
             start_metrics_reporting(dashboard_reporter, dashboard_tracker, interval=1.0)
         )
+    else:
+        print(f"DEBUG: Dashboard NOT initialized. hasattr={hasattr(args, 'dashboard')}, args.dashboard={getattr(args, 'dashboard', None)}, DASHBOARD_AVAILABLE={DASHBOARD_AVAILABLE}")
 
     print("Starting traffic receiver")
     print(f"  Protocol : {args.protocol.upper()}")
