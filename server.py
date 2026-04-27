@@ -18,6 +18,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Dashboard integration
+try:
+    from metrics_reporter import (
+        MetricsReporter,
+        MetricsConfig,
+        ServerMetricsTracker,
+        start_metrics_reporting
+    )
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+
 
 def _format_timestamp() -> str:
     """Fast timestamp formatting for logging. Returns ISO-8601 format with milliseconds."""
@@ -477,7 +489,8 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
 
 async def handle_tcp_client(reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
-                             stats: ServerStats):
+                             stats: ServerStats,
+                             dashboard_tracker=None):
     addr = writer.get_extra_info("peername")
     addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
 
@@ -489,6 +502,10 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     rec = await stats.new_connection(addr_str)
     timestamp = _format_timestamp()
     _log_connection(f"[{timestamp}] [{rec.conn_id:>6}] TCP connect    | {addr_str} ka=on")
+    
+    # Update dashboard
+    if dashboard_tracker:
+        dashboard_tracker.record_connection()
 
     disconnect_reason = "normal"  # Track disconnect reason
     try:
@@ -540,6 +557,11 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
             (rec.tcp_retransmits, rec.tcp_rtt_ms, rec.tcp_rtt_var_ms,
              rec.tcp_snd_cwnd, rec.tcp_lost_packets, rec.tcp_reordering) = get_tcp_info(sock)
         
+        # Update dashboard
+        if dashboard_tracker:
+            dashboard_tracker.record_disconnection()
+            dashboard_tracker.record_bytes(rec.bytes_received, 0)
+        
         rec.disconnect_time = time.monotonic()
         dur = rec.duration if rec.duration is not None else 0.0
         timestamp = _format_timestamp()
@@ -565,10 +587,10 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
             pass
 
 
-async def run_tcp_server(host: str, port: int, stats: ServerStats):
+async def run_tcp_server(host: str, port: int, stats: ServerStats, dashboard_tracker=None):
     async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         try:
-            await handle_tcp_client(r, w, stats)
+            await handle_tcp_client(r, w, stats, dashboard_tracker)
         except Exception as e:
             # Catch any unhandled exceptions to prevent them from propagating
             # to asyncio's internal error handler
@@ -597,9 +619,10 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
     A connection is considered closed after `timeout` seconds of inactivity.
     """
 
-    def __init__(self, stats: ServerStats, timeout: float = 5.0):
+    def __init__(self, stats: ServerStats, timeout: float = 5.0, dashboard_tracker=None):
         self.stats = stats
         self.timeout = timeout
+        self.dashboard_tracker = dashboard_tracker
         self._sessions: Dict[tuple, ConnectionRecord] = {}
         self._timers: Dict[tuple, asyncio.TimerHandle] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -618,6 +641,10 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             self._sessions[addr] = rec
             timestamp = _format_timestamp()
             _log_connection(f"[{timestamp}] [{rec.conn_id:>6}] UDP new sender | {addr_str}")
+            
+            # Update dashboard
+            if self.dashboard_tracker:
+                self.dashboard_tracker.record_connection()
 
         rec = self._sessions[addr]
         rec.bytes_received += len(data)
@@ -657,6 +684,11 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             if rec.udp_expected_packets > 0:
                 rec.udp_lost_packets = rec.udp_expected_packets - rec.messages_received
             
+            # Update dashboard
+            if self.dashboard_tracker:
+                self.dashboard_tracker.record_disconnection()
+                self.dashboard_tracker.record_bytes(rec.bytes_received, 0)
+            
             rec.disconnect_time = time.monotonic()
             dur = rec.duration if rec.duration is not None else 0.0
             msg = (
@@ -693,10 +725,10 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         print(f"[{timestamp}] UDP error: {error_detail}", file=sys.stderr)
 
 
-async def run_udp_server(host: str, port: int, stats: ServerStats):
+async def run_udp_server(host: str, port: int, stats: ServerStats, dashboard_tracker=None):
     loop = asyncio.get_running_loop()  # get_event_loop() is deprecated in async context
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: UDPServerProtocol(stats),
+        lambda: UDPServerProtocol(stats, dashboard_tracker=dashboard_tracker),
         local_addr=(host, port),
         reuse_port=True  # Allow multiple server instances on same port (Linux 3.9+)
     )
@@ -711,6 +743,27 @@ async def run_udp_server(host: str, port: int, stats: ServerStats):
 
 async def run_server(args):
     stats = ServerStats()
+    
+    # Dashboard integration
+    dashboard_reporter = None
+    dashboard_tracker = None
+    dashboard_task = None
+    
+    if hasattr(args, 'dashboard') and args.dashboard and DASHBOARD_AVAILABLE:
+        config = MetricsConfig(
+            dashboard_url=args.dashboard,
+            report_interval=1.0,
+            enabled=True
+        )
+        dashboard_reporter = MetricsReporter(config, 'server')
+        dashboard_tracker = ServerMetricsTracker(
+            protocol=args.protocol,
+            port=args.port,
+            processes=1
+        )
+        dashboard_task = asyncio.create_task(
+            start_metrics_reporting(dashboard_reporter, dashboard_tracker, interval=1.0)
+        )
 
     print("Starting traffic receiver")
     print(f"  Protocol : {args.protocol.upper()}")
@@ -736,6 +789,10 @@ async def run_server(args):
             print(shutdown_msg)
             print(summary_output)
         
+        # Stop dashboard reporting
+        if dashboard_task:
+            dashboard_task.cancel()
+        
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
@@ -744,9 +801,9 @@ async def run_server(args):
 
     try:
         if args.protocol == "tcp":
-            await run_tcp_server(args.host, args.port, stats)
+            await run_tcp_server(args.host, args.port, stats, dashboard_tracker)
         else:
-            await run_udp_server(args.host, args.port, stats)
+            await run_udp_server(args.host, args.port, stats, dashboard_tracker)
     except asyncio.CancelledError:
         pass
 
@@ -801,6 +858,8 @@ EXAMPLES
                         help="Optional file path to log the output results")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-connection messages (still written to output file)")
+    parser.add_argument("--dashboard", type=str, default=None,
+                        help="Dashboard metrics API URL (e.g., http://localhost:8081)")
     return parser.parse_args()
 
 

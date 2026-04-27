@@ -17,6 +17,18 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+# Dashboard integration
+try:
+    from metrics_reporter import (
+        MetricsReporter,
+        MetricsConfig,
+        ClientMetricsTracker,
+        start_metrics_reporting
+    )
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+
 
 def _format_timestamp() -> str:
     """Fast timestamp formatting for logging. Returns ISO-8601 format with milliseconds."""
@@ -283,7 +295,7 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
                              header: bytes, file_data: bytes, size: int,
-                             stats: Stats, timeout: float = 30.0):
+                             stats: Stats, timeout: float = 30.0, dashboard_tracker=None):
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
     result: Optional[ConnectionResult] = None
@@ -335,6 +347,10 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                                       latency_ms=latency_ms, packets_sent=1,
                                       tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
                                       tcp_lost_packets=tcp_lost)
+            
+            # Update dashboard if enabled
+            if dashboard_tracker:
+                dashboard_tracker.record_connection(True, latency_ms, 1)
         else:
             print(
                 f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
@@ -389,10 +405,14 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                                   latency_ms=latency_ms, error=error_detail)
     if result is not None:
         stats.record(result)
+        # Update dashboard for failed file transfers
+        if dashboard_tracker and not result.success:
+            dashboard_tracker.record_connection(False, result.latency_ms, 0)
 
 
 async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
-                         duration: float, stats: Stats, args=None, timeout: float = 30.0):
+                         duration: float, stats: Stats, args=None, timeout: float = 30.0,
+                         dashboard_tracker=None):
     t0 = time.monotonic()
     packets_sent = 0
     pps = args.pps if args else 0
@@ -443,6 +463,10 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   latency_ms=latency_ms, packets_sent=packets_sent,
                                   tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
                                   tcp_lost_packets=tcp_lost)
+        
+        # Update dashboard if enabled
+        if dashboard_tracker:
+            dashboard_tracker.record_connection(True, latency_ms, packets_sent)
     except ConnectionResetError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -489,6 +513,17 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   latency_ms=latency_ms, error=error_detail)
     if result is not None:
         stats.record(result)
+        # Update dashboard for failed connections
+        if dashboard_tracker and not result.success:
+            dashboard_tracker.record_connection(False, result.latency_ms, 0)
+        
+        # Update dashboard metrics if enabled
+        if 'dashboard_tracker' in globals() and globals()['dashboard_tracker']:
+            globals()['dashboard_tracker'].record_connection(
+                success=result.success,
+                latency_ms=result.latency_ms,
+                packets=result.packets_sent
+            )
 
 
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
@@ -584,6 +619,26 @@ async def run_client(args):
     
     # Calculate timeout based on CPS to handle high connection rates
     connection_timeout = calculate_timeout(args.cps)
+    
+    # Dashboard integration
+    dashboard_reporter = None
+    dashboard_tracker = None
+    dashboard_task = None
+    
+    if hasattr(args, 'dashboard') and args.dashboard and DASHBOARD_AVAILABLE:
+        config = MetricsConfig(
+            dashboard_url=args.dashboard,
+            report_interval=1.0,
+            enabled=True
+        )
+        dashboard_reporter = MetricsReporter(config, 'client')
+        dashboard_tracker = ClientMetricsTracker(
+            protocol=args.protocol,
+            processes=1
+        )
+        dashboard_task = asyncio.create_task(
+            start_metrics_reporting(dashboard_reporter, dashboard_tracker, interval=1.0)
+        )
 
     # File-transfer mode: load file into memory once (file already validated in main())
     if args.file:
@@ -686,6 +741,14 @@ async def run_client(args):
             if pending:
                 print(f"Warning: {len(pending)} tasks did not finish gracefully within timeout.", file=sys.stderr)
         print(stats.summary())
+        
+        # Stop dashboard reporting
+        if dashboard_task:
+            dashboard_task.cancel()
+            try:
+                await dashboard_task
+            except asyncio.CancelledError:
+                pass
 
 
 def parse_args():
@@ -765,6 +828,8 @@ EXAMPLES
                              "server verifies SHA-256 checksum per connection")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")
+    parser.add_argument("--dashboard", type=str, default=None,
+                        help="Dashboard metrics API URL (e.g., http://localhost:8081)")
     return parser.parse_args()
 
 
