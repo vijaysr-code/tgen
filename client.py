@@ -198,6 +198,83 @@ def calculate_timeout(cps: float) -> float:
         return 30.0   # Low rate: 30 seconds (default)
 
 
+async def connect_with_retry(host: str, port: int, timeout: float,
+                             max_retries: int = 3, conn_id: int = 0) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """
+    Attempt to connect with exponential backoff retry logic.
+    
+    Retry Strategy:
+    - Attempt 1: timeout=T, no delay
+    - Attempt 2: delay 2s, timeout=T
+    - Attempt 3: delay 5s, timeout=T
+    
+    This gives the server time to recover between attempts while keeping
+    timeout constant to avoid excessive total wait time.
+    
+    Args:
+        host: Target host
+        port: Target port
+        timeout: Connection timeout in seconds (kept constant across retries)
+        max_retries: Maximum number of retry attempts (default: 3)
+        conn_id: Connection ID for logging
+    
+    Returns:
+        Tuple of (reader, writer) on success
+    
+    Raises:
+        asyncio.TimeoutError: If all retry attempts fail with timeout
+        ConnectionRefusedError: If connection is refused (no retry)
+        OSError: For other connection errors (no retry)
+    """
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Apply backoff delay before retry (not on first attempt)
+            if attempt > 0:
+                # Exponential backoff: 2s, 5s, 10s
+                backoff_delay = min(2.0 * (2.5 ** (attempt - 1)), 10.0)
+                timestamp = _format_timestamp()
+                print(f"[{timestamp}] [{conn_id:>6}] Retry {attempt}/{max_retries-1} after {backoff_delay:.1f}s delay | timeout={timeout:.1f}s")
+                await asyncio.sleep(backoff_delay)
+            
+            # Attempt connection with consistent timeout
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout
+            )
+            
+            # Success
+            if attempt > 0:
+                timestamp = _format_timestamp()
+                print(f"[{timestamp}] [{conn_id:>6}] ✓ Retry succeeded after {attempt} attempt(s)")
+            
+            return reader, writer
+            
+        except asyncio.TimeoutError as e:
+            last_error = e
+            timestamp = _format_timestamp()
+            if attempt < max_retries - 1:
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ Timeout on attempt {attempt + 1}/{max_retries}")
+            else:
+                # Final attempt failed
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with timeout")
+                raise
+        
+        except (ConnectionRefusedError, ConnectionResetError, OSError) as e:
+            # Don't retry on these errors - they indicate server is down/unreachable
+            # not just slow to respond
+            timestamp = _format_timestamp()
+            error_type = type(e).__name__
+            print(f"[{timestamp}] [{conn_id:>6}] ✗ {error_type} - no retry")
+            raise
+    
+    # Should not reach here, but raise last error if we do
+    if last_error:
+        raise last_error
+    raise RuntimeError("Unexpected retry loop exit")
+
+
 def make_payload(args) -> bytes:
     """Build the payload bytes.  File mode is handled separately via make_file_transfer()."""
     if args.payload_size > 0:
@@ -300,9 +377,8 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
     t0 = time.monotonic()
     result: Optional[ConnectionResult] = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        # Use retry logic for connection establishment
+        reader, writer = await connect_with_retry(host, port, timeout, max_retries=3, conn_id=conn_id)
         sock = writer.get_extra_info("socket")
         if sock is not None:
             apply_tcp_optimizations(sock)
@@ -418,9 +494,8 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     pps = args.pps if args else 0
     result: Optional[ConnectionResult] = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        # Use retry logic for connection establishment
+        reader, writer = await connect_with_retry(host, port, timeout, max_retries=3, conn_id=conn_id)
 
         # Apply TCP optimizations (keepalive, nodelay, buffers)
         sock = writer.get_extra_info("socket")
