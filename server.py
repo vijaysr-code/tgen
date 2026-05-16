@@ -583,11 +583,24 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
                 disconnect_msg += f" lost={rec.tcp_lost_packets}"
         _log_connection(disconnect_msg)
         
+        # Close connection gracefully
         try:
-            writer.close()
-            await writer.wait_closed()
+            if not writer.is_closing():
+                writer.close()
         except Exception:
+            pass  # Ignore errors during close()
+        
+        # Wait for connection to fully close
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError, RuntimeError, asyncio.CancelledError):
+            # Expected when client closes abruptly (RST, timeout, etc.)
             pass
+        except Exception as e:
+            # Unexpected error - log but don't crash
+            if not _QUIET_MODE:
+                timestamp = _format_timestamp()
+                print(f"[{timestamp}] Warning: Cleanup error for {addr_str}: {e}")
 
 
 async def run_tcp_server(host: str, port: int, stats: ServerStats, dashboard_tracker=None):
