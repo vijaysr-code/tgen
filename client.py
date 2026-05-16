@@ -634,6 +634,16 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             asyncio.DatagramProtocol,
             remote_addr=(host, port)
         )
+        
+        # Increase UDP send buffer for high-throughput scenarios
+        sock = transport.get_extra_info('socket')
+        if sock:
+            try:
+                # Set send buffer to 4MB (sufficient for client sending)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)
+            except OSError:
+                pass  # Ignore if system doesn't allow buffer size changes
+        
         # Capture latency right after endpoint creation (before any sends)
         latency_ms = (time.monotonic() - t0) * 1000
         if pps > 0 and duration > 0:

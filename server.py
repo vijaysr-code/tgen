@@ -644,6 +644,16 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self._loop = asyncio.get_running_loop()
         self.transport = transport # type: ignore
+        
+        # Increase UDP receive buffer for high-throughput scenarios (60K+ connections)
+        sock = transport.get_extra_info('socket')
+        if sock:
+            try:
+                # Set receive buffer to 25MB to handle massive packet rates
+                # Critical for 60K connections sending packets simultaneously
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 26214400)
+            except OSError:
+                pass  # Ignore if system doesn't allow buffer size changes
 
     def datagram_received(self, data: bytes, addr: tuple):
         addr_str = f"{addr[0]}:{addr[1]}"
