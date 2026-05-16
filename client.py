@@ -211,6 +211,14 @@ async def connect_with_retry(host: str, port: int, timeout: float,
     This gives the server time to recover between attempts while keeping
     timeout constant to avoid excessive total wait time.
     
+    Retries on:
+    - asyncio.TimeoutError: Connection timeout (errno 110)
+    - ConnectionResetError: Connection reset by peer (errno 104)
+    
+    Does NOT retry on:
+    - ConnectionRefusedError: Server not listening (fail fast)
+    - OSError: Other OS-level errors (fail fast)
+    
     Args:
         host: Target host
         port: Target port
@@ -223,6 +231,7 @@ async def connect_with_retry(host: str, port: int, timeout: float,
     
     Raises:
         asyncio.TimeoutError: If all retry attempts fail with timeout
+        ConnectionResetError: If all retry attempts fail with RST
         ConnectionRefusedError: If connection is refused (no retry)
         OSError: For other connection errors (no retry)
     """
@@ -261,9 +270,20 @@ async def connect_with_retry(host: str, port: int, timeout: float,
                 print(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with timeout")
                 raise
         
-        except (ConnectionRefusedError, ConnectionResetError, OSError) as e:
-            # Don't retry on these errors - they indicate server is down/unreachable
-            # not just slow to respond
+        except ConnectionResetError as e:
+            # Retry on RST - may be transient server issue (crash, overload, etc.)
+            last_error = e
+            timestamp = _format_timestamp()
+            if attempt < max_retries - 1:
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ Connection reset on attempt {attempt + 1}/{max_retries}")
+            else:
+                # Final attempt failed
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with RST")
+                raise
+        
+        except (ConnectionRefusedError, OSError) as e:
+            # Don't retry on connection refused or other OS errors
+            # These indicate server is down/unreachable, not transient issues
             timestamp = _format_timestamp()
             error_type = type(e).__name__
             print(f"[{timestamp}] [{conn_id:>6}] ✗ {error_type} - no retry")
