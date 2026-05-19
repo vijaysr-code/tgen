@@ -17,6 +17,18 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+# Dashboard integration
+try:
+    from metrics_reporter import (
+        MetricsReporter,
+        MetricsConfig,
+        ClientMetricsTracker,
+        start_metrics_reporting
+    )
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+
 
 def _format_timestamp() -> str:
     """Fast timestamp formatting for logging. Returns ISO-8601 format with milliseconds."""
@@ -186,6 +198,103 @@ def calculate_timeout(cps: float) -> float:
         return 30.0   # Low rate: 30 seconds (default)
 
 
+async def connect_with_retry(host: str, port: int, timeout: float,
+                             max_retries: int = 3, conn_id: int = 0) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """
+    Attempt to connect with exponential backoff retry logic.
+    
+    Retry Strategy:
+    - Attempt 1: timeout=T, no delay
+    - Attempt 2: delay 2s, timeout=T
+    - Attempt 3: delay 5s, timeout=T
+    
+    This gives the server time to recover between attempts while keeping
+    timeout constant to avoid excessive total wait time.
+    
+    Retries on:
+    - asyncio.TimeoutError: Connection timeout (errno 110)
+    - ConnectionResetError: Connection reset by peer (errno 104)
+    
+    Does NOT retry on:
+    - ConnectionRefusedError: Server not listening (fail fast)
+    - OSError: Other OS-level errors (fail fast)
+    
+    Args:
+        host: Target host
+        port: Target port
+        timeout: Connection timeout in seconds (kept constant across retries)
+        max_retries: Maximum number of retry attempts (default: 3)
+        conn_id: Connection ID for logging
+    
+    Returns:
+        Tuple of (reader, writer) on success
+    
+    Raises:
+        asyncio.TimeoutError: If all retry attempts fail with timeout
+        ConnectionResetError: If all retry attempts fail with RST
+        ConnectionRefusedError: If connection is refused (no retry)
+        OSError: For other connection errors (no retry)
+    """
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Apply backoff delay before retry (not on first attempt)
+            if attempt > 0:
+                # Exponential backoff: 2s, 5s, 10s
+                backoff_delay = min(2.0 * (2.5 ** (attempt - 1)), 10.0)
+                timestamp = _format_timestamp()
+                print(f"[{timestamp}] [{conn_id:>6}] Retry {attempt}/{max_retries-1} after {backoff_delay:.1f}s delay | timeout={timeout:.1f}s")
+                await asyncio.sleep(backoff_delay)
+            
+            # Attempt connection with consistent timeout
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout
+            )
+            
+            # Success
+            if attempt > 0:
+                timestamp = _format_timestamp()
+                print(f"[{timestamp}] [{conn_id:>6}] ✓ Retry succeeded after {attempt} attempt(s)")
+            
+            return reader, writer
+            
+        except asyncio.TimeoutError as e:
+            last_error = e
+            timestamp = _format_timestamp()
+            if attempt < max_retries - 1:
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ Timeout on attempt {attempt + 1}/{max_retries}")
+            else:
+                # Final attempt failed
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with timeout")
+                raise
+        
+        except ConnectionResetError as e:
+            # Retry on RST - may be transient server issue (crash, overload, etc.)
+            last_error = e
+            timestamp = _format_timestamp()
+            if attempt < max_retries - 1:
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ Connection reset on attempt {attempt + 1}/{max_retries}")
+            else:
+                # Final attempt failed
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with RST")
+                raise
+        
+        except (ConnectionRefusedError, OSError) as e:
+            # Don't retry on connection refused or other OS errors
+            # These indicate server is down/unreachable, not transient issues
+            timestamp = _format_timestamp()
+            error_type = type(e).__name__
+            print(f"[{timestamp}] [{conn_id:>6}] ✗ {error_type} - no retry")
+            raise
+    
+    # Should not reach here, but raise last error if we do
+    if last_error:
+        raise last_error
+    raise RuntimeError("Unexpected retry loop exit")
+
+
 def make_payload(args) -> bytes:
     """Build the payload bytes.  File mode is handled separately via make_file_transfer()."""
     if args.payload_size > 0:
@@ -283,14 +392,13 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
                              header: bytes, file_data: bytes, size: int,
-                             stats: Stats, timeout: float = 30.0):
+                             stats: Stats, timeout: float = 30.0, dashboard_tracker=None):
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
     result: Optional[ConnectionResult] = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        # Use retry logic for connection establishment
+        reader, writer = await connect_with_retry(host, port, timeout, max_retries=3, conn_id=conn_id)
         sock = writer.get_extra_info("socket")
         if sock is not None:
             apply_tcp_optimizations(sock)
@@ -335,6 +443,10 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                                       latency_ms=latency_ms, packets_sent=1,
                                       tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
                                       tcp_lost_packets=tcp_lost)
+            
+            # Update dashboard if enabled
+            if dashboard_tracker:
+                dashboard_tracker.record_connection(True, latency_ms, 1)
         else:
             print(
                 f"[{conn_id:>6}] TCP file xfer  | latency={latency_ms:.1f}ms "
@@ -389,18 +501,21 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                                   latency_ms=latency_ms, error=error_detail)
     if result is not None:
         stats.record(result)
+        # Update dashboard for failed file transfers
+        if dashboard_tracker and not result.success:
+            dashboard_tracker.record_connection(False, result.latency_ms, 0)
 
 
 async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
-                         duration: float, stats: Stats, args=None, timeout: float = 30.0):
+                         duration: float, stats: Stats, args=None, timeout: float = 30.0,
+                         dashboard_tracker=None):
     t0 = time.monotonic()
     packets_sent = 0
     pps = args.pps if args else 0
     result: Optional[ConnectionResult] = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        # Use retry logic for connection establishment
+        reader, writer = await connect_with_retry(host, port, timeout, max_retries=3, conn_id=conn_id)
 
         # Apply TCP optimizations (keepalive, nodelay, buffers)
         sock = writer.get_extra_info("socket")
@@ -443,6 +558,10 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   latency_ms=latency_ms, packets_sent=packets_sent,
                                   tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
                                   tcp_lost_packets=tcp_lost)
+        
+        # Update dashboard if enabled
+        if dashboard_tracker:
+            dashboard_tracker.record_connection(True, latency_ms, packets_sent)
     except ConnectionResetError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -489,10 +608,21 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                                   latency_ms=latency_ms, error=error_detail)
     if result is not None:
         stats.record(result)
+        # Update dashboard for failed connections
+        if dashboard_tracker and not result.success:
+            dashboard_tracker.record_connection(False, result.latency_ms, 0)
+        
+        # Update dashboard metrics if enabled
+        if 'dashboard_tracker' in globals() and globals()['dashboard_tracker']:
+            globals()['dashboard_tracker'].record_connection(
+                success=result.success,
+                latency_ms=result.latency_ms,
+                packets=result.packets_sent
+            )
 
 
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
-                         duration: float, stats: Stats, args=None):
+                         duration: float, stats: Stats, args=None, dashboard_tracker=None):
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
     packets_sent = 0
@@ -504,6 +634,16 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             asyncio.DatagramProtocol,
             remote_addr=(host, port)
         )
+        
+        # Increase UDP send buffer for high-throughput scenarios
+        sock = transport.get_extra_info('socket')
+        if sock:
+            try:
+                # Set send buffer to 4MB (sufficient for client sending)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)
+            except OSError:
+                pass  # Ignore if system doesn't allow buffer size changes
+        
         # Capture latency right after endpoint creation (before any sends)
         latency_ms = (time.monotonic() - t0) * 1000
         if pps > 0 and duration > 0:
@@ -538,6 +678,10 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent)
+        
+        # Update dashboard if enabled
+        if dashboard_tracker:
+            dashboard_tracker.record_connection(True, latency_ms, packets_sent)
     except OSError as e:
         # UDP-specific errors:
         # ECONNREFUSED (111): ICMP port unreachable received
@@ -562,6 +706,10 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
         print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, error=error_detail)
+        
+        # Update dashboard if enabled
+        if dashboard_tracker:
+            dashboard_tracker.record_connection(False, latency_ms, 0)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -584,6 +732,26 @@ async def run_client(args):
     
     # Calculate timeout based on CPS to handle high connection rates
     connection_timeout = calculate_timeout(args.cps)
+    
+    # Dashboard integration
+    dashboard_reporter = None
+    dashboard_tracker = None
+    dashboard_task = None
+    
+    if hasattr(args, 'dashboard') and args.dashboard and DASHBOARD_AVAILABLE:
+        config = MetricsConfig(
+            dashboard_url=args.dashboard,
+            report_interval=1.0,
+            enabled=True
+        )
+        dashboard_reporter = MetricsReporter(config, 'client')
+        dashboard_tracker = ClientMetricsTracker(
+            protocol=args.protocol,
+            processes=1
+        )
+        dashboard_task = asyncio.create_task(
+            start_metrics_reporting(dashboard_reporter, dashboard_tracker, interval=1.0)
+        )
 
     # File-transfer mode: load file into memory once (file already validated in main())
     if args.file:
@@ -644,10 +812,12 @@ async def run_client(args):
                 elif args.protocol == "tcp":
                     coro = tcp_connection(conn_id, args.host, args.port, payload,
                                           args.duration, stats, args,
-                                          timeout=connection_timeout)
+                                          timeout=connection_timeout,
+                                          dashboard_tracker=dashboard_tracker)
                 else:
                     coro = udp_connection(conn_id, args.host, args.port, payload,
-                                          args.duration, stats, args)
+                                          args.duration, stats, args,
+                                          dashboard_tracker=dashboard_tracker)
 
                 task = asyncio.create_task(coro)
                 tasks.add(task)
@@ -686,6 +856,14 @@ async def run_client(args):
             if pending:
                 print(f"Warning: {len(pending)} tasks did not finish gracefully within timeout.", file=sys.stderr)
         print(stats.summary())
+        
+        # Stop dashboard reporting
+        if dashboard_task:
+            dashboard_task.cancel()
+            try:
+                await dashboard_task
+            except asyncio.CancelledError:
+                pass
 
 
 def parse_args():
@@ -765,6 +943,8 @@ EXAMPLES
                              "server verifies SHA-256 checksum per connection")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")
+    parser.add_argument("--dashboard", type=str, default=None,
+                        help="Dashboard metrics API URL (e.g., http://localhost:8081)")
     return parser.parse_args()
 
 

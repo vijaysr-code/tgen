@@ -173,8 +173,10 @@ class DashboardServer:
             data = await request.json()
             metrics = ServerMetrics(**data)
             await self.collector.add_server_metrics(metrics)
+            print(f"DEBUG: Received server metrics: total={metrics.total_connections}, active={metrics.active_connections}")
             return web.json_response({'status': 'ok'})
         except Exception as e:
+            print(f"DEBUG: Error handling server metrics: {e}")
             return web.json_response({'status': 'error', 'message': str(e)}, status=400)
     
     async def handle_client_metrics(self, request):
@@ -183,8 +185,10 @@ class DashboardServer:
             data = await request.json()
             metrics = ClientMetrics(**data)
             await self.collector.add_client_metrics(metrics)
+            print(f"DEBUG: Received client metrics: total={metrics.total_connections}, successful={metrics.successful}")
             return web.json_response({'status': 'ok'})
         except Exception as e:
+            print(f"DEBUG: Error handling client metrics: {e}")
             return web.json_response({'status': 'error', 'message': str(e)}, status=400)
     
     def _get_dashboard_html(self) -> str:
