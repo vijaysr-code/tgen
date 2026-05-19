@@ -89,6 +89,7 @@ class ConnectionRecord:
     client_addr: str
     connect_time: float
     disconnect_time: Optional[float] = None
+    disconnect_reason: str = "normal"
     bytes_received: int = 0
     messages_received: int = 0
     # File-transfer fields (populated only in file-transfer mode)
@@ -269,15 +270,53 @@ class ServerStats:
                 total_retx = sum(r.tcp_retransmits for r in tcp_records if r.tcp_retransmits is not None)
                 total_lost = sum(r.tcp_lost_packets for r in tcp_records if r.tcp_lost_packets is not None)
                 rtt_vals = [r.tcp_rtt_ms for r in tcp_records if r.tcp_rtt_ms is not None]
+                rtt_var_vals = [r.tcp_rtt_var_ms for r in tcp_records if r.tcp_rtt_var_ms is not None]
+                cwnd_vals = [r.tcp_snd_cwnd for r in tcp_records if r.tcp_snd_cwnd is not None]
+                reordering_vals = [r.tcp_reordering for r in tcp_records if r.tcp_reordering is not None]
+                tcp_all_records = [r for r in self.records if ":" in r.client_addr]
+                tcp_retx_conns = sum(1 for r in tcp_records if (r.tcp_retransmits or 0) > 0)
+                tcp_loss_conns = sum(1 for r in tcp_records if (r.tcp_lost_packets or 0) > 0)
+                tcp_avg_bytes = (sum(r.bytes_received for r in tcp_all_records) / len(tcp_all_records)) if tcp_all_records else 0.0
+                tcp_avg_msgs = (sum(r.messages_received for r in tcp_all_records) / len(tcp_all_records)) if tcp_all_records else 0.0
+                disconnect_normal = sum(1 for r in tcp_all_records if r.disconnect_reason == "normal")
+                disconnect_rst = sum(1 for r in tcp_all_records if r.disconnect_reason == "RST")
+                disconnect_aborted = sum(1 for r in tcp_all_records if r.disconnect_reason == "aborted")
+                disconnect_broken = sum(1 for r in tcp_all_records if r.disconnect_reason == "broken_pipe")
+                disconnect_incomplete = sum(1 for r in tcp_all_records if r.disconnect_reason == "incomplete")
+                disconnect_other = sum(
+                    1 for r in tcp_all_records
+                    if r.disconnect_reason not in {"normal", "RST", "aborted", "broken_pipe", "incomplete"}
+                )
 
                 lines.append("")
                 lines.append(f"  TCP Statistics Summary:")
                 lines.append(f"    Total retransmits : {total_retx}")
                 lines.append(f"    Total lost packets: {total_lost}")
+                lines.append(f"    Connections w/ retx: {tcp_retx_conns}")
+                lines.append(f"    Connections w/ loss: {tcp_loss_conns}")
+                lines.append(f"    Avg bytes / conn  : {tcp_avg_bytes:.1f}")
+                lines.append(f"    Avg msgs / conn   : {tcp_avg_msgs:.1f}")
                 if rtt_vals:
                     lines.append(f"    RTT avg           : {sum(rtt_vals)/len(rtt_vals):.2f}ms")
                     lines.append(f"    RTT min           : {min(rtt_vals):.2f}ms")
                     lines.append(f"    RTT max           : {max(rtt_vals):.2f}ms")
+                if rtt_var_vals:
+                    lines.append(f"    RTT var avg       : {sum(rtt_var_vals)/len(rtt_var_vals):.2f}ms")
+                    lines.append(f"    RTT var min       : {min(rtt_var_vals):.2f}ms")
+                    lines.append(f"    RTT var max       : {max(rtt_var_vals):.2f}ms")
+                if cwnd_vals:
+                    lines.append(f"    CWND avg          : {sum(cwnd_vals)/len(cwnd_vals):.2f}")
+                    lines.append(f"    CWND min          : {min(cwnd_vals)}")
+                    lines.append(f"    CWND max          : {max(cwnd_vals)}")
+                if reordering_vals:
+                    lines.append(f"    Reordering avg    : {sum(reordering_vals)/len(reordering_vals):.2f}")
+                    lines.append(f"    Reordering max    : {max(reordering_vals)}")
+                lines.append(f"    Disconnect normal : {disconnect_normal}")
+                lines.append(f"    Disconnect RST    : {disconnect_rst}")
+                lines.append(f"    Disconnect aborted: {disconnect_aborted}")
+                lines.append(f"    Disconnect broken : {disconnect_broken}")
+                lines.append(f"    Disconnect incomplete: {disconnect_incomplete}")
+                lines.append(f"    Disconnect other  : {disconnect_other}")
             
             # Add UDP statistics summary if available
             if has_udp_stats:
@@ -293,6 +332,8 @@ class ServerStats:
                 lines.append(f"    Total received    : {total_received}")
                 lines.append(f"    Total lost        : {total_lost} ({loss_pct:.2f}%)")
 
+        lines.append("")
+        lines.append(f"  Final total bytes received: {total_bytes}")
         lines.append("=" * 92)
         return "\n".join(lines)
 
@@ -561,6 +602,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
             dashboard_tracker.record_disconnection()
             dashboard_tracker.record_bytes(rec.bytes_received, 0)
         
+        rec.disconnect_reason = disconnect_reason
         rec.disconnect_time = time.monotonic()
         dur = rec.duration if rec.duration is not None else 0.0
         timestamp = _format_timestamp()
