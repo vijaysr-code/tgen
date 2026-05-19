@@ -720,6 +720,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
     packets_sent = 0
     pps = args.pps if args else 0
     transport = None
+    bytes_sent = 0
     result: Optional[ConnectionResult] = None
     try:
         transport, protocol = await loop.create_datagram_endpoint(
@@ -749,6 +750,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 import struct
                 packet = struct.pack('!II', seq_num, expected_packets) + payload
                 transport.sendto(packet)
+                bytes_sent += len(packet)
                 packets_sent += 1
                 seq_num += 1
                 remaining = deadline - time.monotonic()
@@ -762,6 +764,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             import struct
             packet = struct.pack('!II', 0, 1) + payload
             transport.sendto(packet)
+            bytes_sent += len(packet)
             packets_sent = 1
             timestamp = _format_timestamp()
             print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(packet)}B")
@@ -769,7 +772,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 await asyncio.sleep(duration)
 
         result = ConnectionResult(conn_id=conn_id, success=True,
-                                  latency_ms=latency_ms, packets_sent=packets_sent)
+                                  latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent)
         
         # Update dashboard if enabled
         if dashboard_tracker:
@@ -797,7 +800,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             error_detail = str(e)
         print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
         
         # Update dashboard if enabled
         if dashboard_tracker:
@@ -808,7 +811,7 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
         error_detail = f"{type(e).__name__}: {e}"
         print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
     finally:
         if transport is not None:
             transport.close()  # always close, even on exception
