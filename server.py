@@ -101,8 +101,6 @@ class ConnectionRecord:
     tcp_snd_cwnd: Optional[int] = None
     tcp_lost_packets: Optional[int] = None
     tcp_reordering: Optional[int] = None
-    tcp_bytes_sent: Optional[int] = None
-    tcp_bytes_received: Optional[int] = None
     # UDP statistics (simple packet counting)
     udp_expected_packets: int = 0  # Expected total packets (from client)
     udp_lost_packets: int = 0
@@ -271,8 +269,6 @@ class ServerStats:
                 total_retx = sum(r.tcp_retransmits for r in tcp_records if r.tcp_retransmits is not None)
                 total_lost = sum(r.tcp_lost_packets for r in tcp_records if r.tcp_lost_packets is not None)
                 rtt_vals = [r.tcp_rtt_ms for r in tcp_records if r.tcp_rtt_ms is not None]
-                bytes_sent_vals = [r.tcp_bytes_sent for r in tcp_records if r.tcp_bytes_sent is not None]
-                bytes_rcv_vals = [r.tcp_bytes_received for r in tcp_records if r.tcp_bytes_received is not None]
 
                 lines.append("")
                 lines.append(f"  TCP Statistics Summary:")
@@ -282,12 +278,6 @@ class ServerStats:
                     lines.append(f"    RTT avg           : {sum(rtt_vals)/len(rtt_vals):.2f}ms")
                     lines.append(f"    RTT min           : {min(rtt_vals):.2f}ms")
                     lines.append(f"    RTT max           : {max(rtt_vals):.2f}ms")
-                if bytes_sent_vals:
-                    total_tcp_sent = sum(bytes_sent_vals)
-                    lines.append(f"    Total TCP sent    : {total_tcp_sent}B")
-                if bytes_rcv_vals:
-                    total_tcp_rcv = sum(bytes_rcv_vals)
-                    lines.append(f"    Total TCP rcv'd   : {total_tcp_rcv}B")
             
             # Add UDP statistics summary if available
             if has_udp_stats:
@@ -353,15 +343,14 @@ def apply_keepalive(sock: socket.socket) -> None:
 
 
 def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[float],
-                                                 Optional[int], Optional[int], Optional[int],
-                                                 Optional[int], Optional[int]]:
+                                                 Optional[int], Optional[int], Optional[int]]:
     """
     Retrieve TCP socket statistics (Linux only).
-    Returns: (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost_packets, reordering, bytes_sent, bytes_received)
+    Returns: (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost_packets, reordering)
     """
     system = platform.system()
     if system != "Linux":
-        return (None, None, None, None, None, None, None, None)
+        return (None, None, None, None, None, None)
 
     try:
         # TCP_INFO socket option (Linux-specific)
@@ -375,16 +364,13 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         # Offsets based on Linux kernel struct tcp_info (kernel 4.x+, x86_64)
         import struct
 
-        # Correct offsets for struct tcp_info:
-        # tcpi_state (u8) at offset 0
-        # tcpi_retransmits (u8) at offset 2  ← CORRECTED
+        # Stable offsets for commonly used struct tcp_info fields:
+        # tcpi_retransmits (u8) at offset 2
         # tcpi_lost (u32) at offset 32
-        # tcpi_rtt (u32) at offset 68 (in microseconds)  ← CORRECTED
-        # tcpi_rttvar (u32) at offset 72 (in microseconds)  ← CORRECTED
-        # tcpi_snd_cwnd (u32) at offset 80  ← CORRECTED
+        # tcpi_rtt (u32) at offset 68 (microseconds)
+        # tcpi_rttvar (u32) at offset 72 (microseconds)
+        # tcpi_snd_cwnd (u32) at offset 80
         # tcpi_reordering (u32) at offset 88
-        # tcpi_bytes_sent (u64) at offset 104
-        # tcpi_bytes_received (u64) at offset 112
 
         retransmits = struct.unpack_from('B', tcp_info, 2)[0]   # tcpi_retransmits (u8)
         rtt_us = struct.unpack_from('I', tcp_info, 68)[0]       # tcpi_rtt (u32, microseconds)
@@ -392,17 +378,15 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         snd_cwnd = struct.unpack_from('I', tcp_info, 80)[0]     # tcpi_snd_cwnd (u32)
         lost = struct.unpack_from('I', tcp_info, 32)[0]         # tcpi_lost (u32)
         reordering = struct.unpack_from('I', tcp_info, 88)[0]   # tcpi_reordering (u32)
-        bytes_sent = struct.unpack_from('Q', tcp_info, 104)[0]  # tcpi_bytes_sent (u64)
-        bytes_received = struct.unpack_from('Q', tcp_info, 112)[0]  # tcpi_bytes_received (u64)
 
         # Convert microseconds to milliseconds
         rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
         rtt_var_ms = rtt_var_us / 1000.0 if rtt_var_us > 0 else None
 
-        return (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost, reordering, bytes_sent, bytes_received)
+        return (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost, reordering)
     except Exception:
         # TCP_INFO not available or parsing failed
-        return (None, None, None, None, None, None, None, None)
+        return (None, None, None, None, None, None)
 
 async def _handle_file_transfer(reader: asyncio.StreamReader,
                                  writer: asyncio.StreamWriter,
@@ -570,8 +554,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
         # Collect TCP statistics before closing
         if sock is not None:
             (rec.tcp_retransmits, rec.tcp_rtt_ms, rec.tcp_rtt_var_ms,
-             rec.tcp_snd_cwnd, rec.tcp_lost_packets, rec.tcp_reordering,
-             rec.tcp_bytes_sent, rec.tcp_bytes_received) = get_tcp_info(sock)
+             rec.tcp_snd_cwnd, rec.tcp_lost_packets, rec.tcp_reordering) = get_tcp_info(sock)
         
         # Update dashboard
         if dashboard_tracker:
@@ -594,8 +577,6 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
                 disconnect_msg += f" rtt={rec.tcp_rtt_ms:.1f}ms"
             if rec.tcp_lost_packets is not None and rec.tcp_lost_packets > 0:
                 disconnect_msg += f" lost={rec.tcp_lost_packets}"
-            if rec.tcp_bytes_sent is not None:
-                disconnect_msg += f" | tcp_sent={rec.tcp_bytes_sent}B tcp_rcv={rec.tcp_bytes_received}B"
         _log_connection(disconnect_msg)
         
         # Close connection gracefully

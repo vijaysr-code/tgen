@@ -98,8 +98,6 @@ class ConnectionResult:
     tcp_retransmits: Optional[int] = None
     tcp_rtt_ms: Optional[float] = None
     tcp_lost_packets: Optional[int] = None
-    tcp_bytes_sent: Optional[int] = None
-    tcp_bytes_received: Optional[int] = None
 
 
 @dataclass
@@ -114,8 +112,6 @@ class Stats:
     tcp_retransmits_list: List[int] = field(default_factory=list)
     tcp_rtt_list: List[float] = field(default_factory=list)
     tcp_lost_list: List[int] = field(default_factory=list)
-    tcp_bytes_sent_list: List[int] = field(default_factory=list)
-    tcp_bytes_received_list: List[int] = field(default_factory=list)
 
     def record(self, result: ConnectionResult):
         self.total += 1
@@ -130,10 +126,6 @@ class Stats:
                 self.tcp_rtt_list.append(result.tcp_rtt_ms)
             if result.tcp_lost_packets is not None:
                 self.tcp_lost_list.append(result.tcp_lost_packets)
-            if result.tcp_bytes_sent is not None:
-                self.tcp_bytes_sent_list.append(result.tcp_bytes_sent)
-            if result.tcp_bytes_received is not None:
-                self.tcp_bytes_received_list.append(result.tcp_bytes_received)
         else:
             self.failed += 1
 
@@ -182,20 +174,6 @@ class Stats:
                 lines += [
                     f"    Total lost packets: {total_lost}",
                 ]
-        if self.tcp_bytes_sent_list:
-            total_tcp_sent = sum(self.tcp_bytes_sent_list)
-            total_app_sent = self.total_bytes_sent
-            if total_app_sent > 0:
-                overhead_pct = (total_tcp_sent - total_app_sent) / total_app_sent * 100
-                lines += [
-                    f"    App bytes sent    : {total_app_sent}",
-                    f"    TCP bytes sent    : {total_tcp_sent} (overhead: {overhead_pct:.1f}%)",
-                ]
-        if self.tcp_bytes_received_list:
-            total_tcp_rcv = sum(self.tcp_bytes_received_list)
-            lines += [
-                f"    TCP bytes rcv'd   : {total_tcp_rcv}",
-            ]
 
         lines.append("=" * 55)
         return "\n".join(lines)
@@ -384,14 +362,14 @@ def apply_keepalive(sock: socket.socket) -> None:
     apply_tcp_optimizations(sock)
 
 
-def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[int], Optional[int], Optional[int]]:
+def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[int]]:
     """
     Retrieve TCP socket statistics (Linux only).
-    Returns: (retransmits, rtt_ms, lost_packets, bytes_sent, bytes_received)
+    Returns: (retransmits, rtt_ms, lost_packets)
     """
     system = platform.system()
     if system != "Linux":
-        return (None, None, None, None, None)
+        return (None, None, None)
 
     try:
         # TCP_INFO socket option (Linux-specific)
@@ -407,15 +385,13 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         retransmits = struct.unpack_from('B', tcp_info, 2)[0]   # tcpi_retransmits (u8)
         rtt_us = struct.unpack_from('I', tcp_info, 68)[0]       # tcpi_rtt (u32, microseconds)
         lost = struct.unpack_from('I', tcp_info, 32)[0]         # tcpi_lost (u32)
-        bytes_sent = struct.unpack_from('Q', tcp_info, 104)[0]  # tcpi_bytes_sent (u64)
-        bytes_received = struct.unpack_from('Q', tcp_info, 112)[0]  # tcpi_bytes_received (u64)
 
         # Convert microseconds to milliseconds
         rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
 
-        return (retransmits, rtt_ms, lost, bytes_sent, bytes_received)
+        return (retransmits, rtt_ms, lost)
     except Exception:
-        return (None, None, None, None, None)
+        return (None, None, None)
 
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
@@ -452,7 +428,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         response_str = response.decode(errors="replace").strip()
 
         # Collect TCP statistics before closing
-        tcp_retx, tcp_rtt, tcp_lost, tcp_bytes_sent, tcp_bytes_rcv = get_tcp_info(sock) if sock else (None, None, None, None, None)
+        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
 
         writer.close()
         try:
@@ -474,8 +450,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
             result = ConnectionResult(conn_id=conn_id, success=True,
                                       latency_ms=latency_ms, packets_sent=1, bytes_sent=bytes_sent,
                                       tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
-                                      tcp_lost_packets=tcp_lost, tcp_bytes_sent=tcp_bytes_sent,
-                                      tcp_bytes_received=tcp_bytes_rcv)
+                                      tcp_lost_packets=tcp_lost)
 
             # Update dashboard if enabled
             if dashboard_tracker:
@@ -582,7 +557,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 await asyncio.sleep(duration)
 
         # Collect TCP statistics before closing
-        tcp_retx, tcp_rtt, tcp_lost, tcp_bytes_sent, tcp_bytes_rcv = get_tcp_info(sock) if sock else (None, None, None, None, None)
+        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
 
         writer.close()
         try:
@@ -593,8 +568,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent,
                                   tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
-                                  tcp_lost_packets=tcp_lost, tcp_bytes_sent=tcp_bytes_sent,
-                                  tcp_bytes_received=tcp_bytes_rcv)
+                                  tcp_lost_packets=tcp_lost)
 
         # Update dashboard if enabled
         if dashboard_tracker:
