@@ -92,11 +92,14 @@ class ConnectionResult:
     success: bool
     latency_ms: float
     packets_sent: int = 0
+    bytes_sent: int = 0
     error: Optional[str] = None
     # TCP statistics (Linux only)
     tcp_retransmits: Optional[int] = None
     tcp_rtt_ms: Optional[float] = None
     tcp_lost_packets: Optional[int] = None
+    tcp_bytes_sent: Optional[int] = None
+    tcp_bytes_received: Optional[int] = None
 
 
 @dataclass
@@ -105,11 +108,14 @@ class Stats:
     success: int = 0
     failed: int = 0
     total_packets: int = 0
+    total_bytes_sent: int = 0
     latencies: List[float] = field(default_factory=list)
     start_time: float = field(default_factory=time.monotonic)
     tcp_retransmits_list: List[int] = field(default_factory=list)
     tcp_rtt_list: List[float] = field(default_factory=list)
     tcp_lost_list: List[int] = field(default_factory=list)
+    tcp_bytes_sent_list: List[int] = field(default_factory=list)
+    tcp_bytes_received_list: List[int] = field(default_factory=list)
 
     def record(self, result: ConnectionResult):
         self.total += 1
@@ -117,12 +123,17 @@ class Stats:
             self.success += 1
             self.latencies.append(result.latency_ms)
             self.total_packets += result.packets_sent
+            self.total_bytes_sent += result.bytes_sent
             if result.tcp_retransmits is not None:
                 self.tcp_retransmits_list.append(result.tcp_retransmits)
             if result.tcp_rtt_ms is not None:
                 self.tcp_rtt_list.append(result.tcp_rtt_ms)
             if result.tcp_lost_packets is not None:
                 self.tcp_lost_list.append(result.tcp_lost_packets)
+            if result.tcp_bytes_sent is not None:
+                self.tcp_bytes_sent_list.append(result.tcp_bytes_sent)
+            if result.tcp_bytes_received is not None:
+                self.tcp_bytes_received_list.append(result.tcp_bytes_received)
         else:
             self.failed += 1
 
@@ -139,6 +150,7 @@ class Stats:
             f"  Failed            : {self.failed}",
             f"  Observed rate     : {rate:.2f} conn/s",
             f"  Total packets sent: {self.total_packets}",
+            f"  Total bytes sent  : {self.total_bytes_sent}",
         ]
         if self.latencies:
             avg = sum(self.latencies) / len(self.latencies)
@@ -147,7 +159,7 @@ class Stats:
                 f"  Latency min       : {min(self.latencies):.2f}ms",
                 f"  Latency max       : {max(self.latencies):.2f}ms",
             ]
-        
+
         # TCP statistics summary
         if self.tcp_retransmits_list:
             total_retx = sum(self.tcp_retransmits_list)
@@ -170,7 +182,21 @@ class Stats:
                 lines += [
                     f"    Total lost packets: {total_lost}",
                 ]
-        
+        if self.tcp_bytes_sent_list:
+            total_tcp_sent = sum(self.tcp_bytes_sent_list)
+            total_app_sent = self.total_bytes_sent
+            if total_app_sent > 0:
+                overhead_pct = (total_tcp_sent - total_app_sent) / total_app_sent * 100
+                lines += [
+                    f"    App bytes sent    : {total_app_sent}",
+                    f"    TCP bytes sent    : {total_tcp_sent} (overhead: {overhead_pct:.1f}%)",
+                ]
+        if self.tcp_bytes_received_list:
+            total_tcp_rcv = sum(self.tcp_bytes_received_list)
+            lines += [
+                f"    TCP bytes rcv'd   : {total_tcp_rcv}",
+            ]
+
         lines.append("=" * 55)
         return "\n".join(lines)
 
@@ -358,36 +384,38 @@ def apply_keepalive(sock: socket.socket) -> None:
     apply_tcp_optimizations(sock)
 
 
-def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[int]]:
+def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[int], Optional[int], Optional[int]]:
     """
     Retrieve TCP socket statistics (Linux only).
-    Returns: (retransmits, rtt_ms, lost_packets)
+    Returns: (retransmits, rtt_ms, lost_packets, bytes_sent, bytes_received)
     """
     system = platform.system()
     if system != "Linux":
-        return (None, None, None)
-    
+        return (None, None, None, None, None)
+
     try:
         # TCP_INFO socket option (Linux-specific)
         TCP_INFO = 11
-        
+
         # Get TCP_INFO structure
         tcp_info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
-        
+
         # Parse relevant fields from tcp_info structure
         # Offsets based on struct tcp_info (Linux kernel 4.x+, x86_64)
         import struct
-        
+
         retransmits = struct.unpack_from('B', tcp_info, 2)[0]   # tcpi_retransmits (u8)
         rtt_us = struct.unpack_from('I', tcp_info, 68)[0]       # tcpi_rtt (u32, microseconds)
         lost = struct.unpack_from('I', tcp_info, 32)[0]         # tcpi_lost (u32)
-        
+        bytes_sent = struct.unpack_from('Q', tcp_info, 104)[0]  # tcpi_bytes_sent (u64)
+        bytes_received = struct.unpack_from('Q', tcp_info, 112)[0]  # tcpi_bytes_received (u64)
+
         # Convert microseconds to milliseconds
         rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
-        
-        return (retransmits, rtt_ms, lost)
+
+        return (retransmits, rtt_ms, lost, bytes_sent, bytes_received)
     except Exception:
-        return (None, None, None)
+        return (None, None, None, None, None)
 
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
@@ -406,13 +434,17 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         latency_ms = (time.monotonic() - t0) * 1000
 
         # Send header then file data in chunks
+        bytes_sent = 0
         writer.write(header)
+        bytes_sent += len(header)
         await writer.drain()
-        
+
         # Send file data in 64KB chunks to avoid blocking the event loop
         chunk_size = 65536
         for i in range(0, len(file_data), chunk_size):
-            writer.write(file_data[i:i + chunk_size])
+            chunk = file_data[i:i + chunk_size]
+            writer.write(chunk)
+            bytes_sent += len(chunk)
             await writer.drain()
 
         # Read server response: "OK\n" or "FAIL:<reason>\n"
@@ -420,8 +452,8 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         response_str = response.decode(errors="replace").strip()
 
         # Collect TCP statistics before closing
-        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
-        
+        tcp_retx, tcp_rtt, tcp_lost, tcp_bytes_sent, tcp_bytes_rcv = get_tcp_info(sock) if sock else (None, None, None, None, None)
+
         writer.close()
         try:
             await writer.wait_closed()
@@ -440,10 +472,11 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                     msg += f" rtt={tcp_rtt:.1f}ms"
             print(msg)
             result = ConnectionResult(conn_id=conn_id, success=True,
-                                      latency_ms=latency_ms, packets_sent=1,
+                                      latency_ms=latency_ms, packets_sent=1, bytes_sent=bytes_sent,
                                       tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
-                                      tcp_lost_packets=tcp_lost)
-            
+                                      tcp_lost_packets=tcp_lost, tcp_bytes_sent=tcp_bytes_sent,
+                                      tcp_bytes_received=tcp_bytes_rcv)
+
             # Update dashboard if enabled
             if dashboard_tracker:
                 dashboard_tracker.record_connection(True, latency_ms, 1)
@@ -453,7 +486,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
                 f"total={elapsed_ms:.0f}ms {size}B | checksum=FAIL ({response_str})"
             )
             result = ConnectionResult(conn_id=conn_id, success=False,
-                                      latency_ms=latency_ms,
+                                      latency_ms=latency_ms, bytes_sent=bytes_sent,
                                       error=f"checksum mismatch: {response_str}")
     except ConnectionResetError as e:
         latency_ms = (time.monotonic() - t0) * 1000
@@ -511,6 +544,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                          dashboard_tracker=None):
     t0 = time.monotonic()
     packets_sent = 0
+    bytes_sent = 0
     pps = args.pps if args else 0
     result: Optional[ConnectionResult] = None
     try:
@@ -531,6 +565,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             deadline = time.monotonic() + duration
             while time.monotonic() < deadline:
                 writer.write(payload)
+                bytes_sent += len(payload)
                 await writer.drain()
                 packets_sent += 1
                 remaining = deadline - time.monotonic()
@@ -540,14 +575,15 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         else:
             # Single send (original behaviour)
             writer.write(payload)
+            bytes_sent += len(payload)
             await writer.drain()
             packets_sent = 1
             if duration > 0:
                 await asyncio.sleep(duration)
 
         # Collect TCP statistics before closing
-        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
-        
+        tcp_retx, tcp_rtt, tcp_lost, tcp_bytes_sent, tcp_bytes_rcv = get_tcp_info(sock) if sock else (None, None, None, None, None)
+
         writer.close()
         try:
             await writer.wait_closed()
@@ -555,10 +591,11 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             pass
 
         result = ConnectionResult(conn_id=conn_id, success=True,
-                                  latency_ms=latency_ms, packets_sent=packets_sent,
+                                  latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent,
                                   tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
-                                  tcp_lost_packets=tcp_lost)
-        
+                                  tcp_lost_packets=tcp_lost, tcp_bytes_sent=tcp_bytes_sent,
+                                  tcp_bytes_received=tcp_bytes_rcv)
+
         # Update dashboard if enabled
         if dashboard_tracker:
             dashboard_tracker.record_connection(True, latency_ms, packets_sent)
@@ -567,51 +604,51 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | RST: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"RST: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"RST: {e}")
     except ConnectionRefusedError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | refused: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"refused: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"refused: {e}")
     except ConnectionAbortedError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | aborted: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"aborted: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"aborted: {e}")
     except BrokenPipeError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | broken_pipe: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"broken_pipe: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"broken_pipe: {e}")
     except asyncio.TimeoutError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | timeout: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"timeout: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"timeout: {e}")
     except OSError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         error_detail = f"error:{e.errno}" if hasattr(e, 'errno') else str(e)
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         error_detail = f"{type(e).__name__}: {e}"
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
     if result is not None:
         stats.record(result)
         # Update dashboard for failed connections
         if dashboard_tracker and not result.success:
             dashboard_tracker.record_connection(False, result.latency_ms, 0)
-        
+
         # Update dashboard metrics if enabled
         if 'dashboard_tracker' in globals() and globals()['dashboard_tracker']:
             globals()['dashboard_tracker'].record_connection(
