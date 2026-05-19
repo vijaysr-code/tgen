@@ -94,10 +94,14 @@ class ConnectionResult:
     packets_sent: int = 0
     bytes_sent: int = 0
     error: Optional[str] = None
+    retry_attempts: int = 0
     # TCP statistics (Linux only)
     tcp_retransmits: Optional[int] = None
     tcp_rtt_ms: Optional[float] = None
+    tcp_rtt_var_ms: Optional[float] = None
+    tcp_snd_cwnd: Optional[int] = None
     tcp_lost_packets: Optional[int] = None
+    tcp_reordering: Optional[int] = None
 
 
 @dataclass
@@ -107,11 +111,21 @@ class Stats:
     failed: int = 0
     total_packets: int = 0
     total_bytes_sent: int = 0
+    total_retry_attempts: int = 0
     latencies: List[float] = field(default_factory=list)
     start_time: float = field(default_factory=time.monotonic)
     tcp_retransmits_list: List[int] = field(default_factory=list)
     tcp_rtt_list: List[float] = field(default_factory=list)
+    tcp_rtt_var_list: List[float] = field(default_factory=list)
+    tcp_cwnd_list: List[int] = field(default_factory=list)
     tcp_lost_list: List[int] = field(default_factory=list)
+    tcp_reordering_list: List[int] = field(default_factory=list)
+    rst_failures: int = 0
+    timeout_failures: int = 0
+    refused_failures: int = 0
+    aborted_failures: int = 0
+    broken_pipe_failures: int = 0
+    other_failures: int = 0
 
     def record(self, result: ConnectionResult):
         self.total += 1
@@ -120,14 +134,36 @@ class Stats:
             self.latencies.append(result.latency_ms)
             self.total_packets += result.packets_sent
             self.total_bytes_sent += result.bytes_sent
+            self.total_retry_attempts += result.retry_attempts
             if result.tcp_retransmits is not None:
                 self.tcp_retransmits_list.append(result.tcp_retransmits)
             if result.tcp_rtt_ms is not None:
                 self.tcp_rtt_list.append(result.tcp_rtt_ms)
+            if result.tcp_rtt_var_ms is not None:
+                self.tcp_rtt_var_list.append(result.tcp_rtt_var_ms)
+            if result.tcp_snd_cwnd is not None:
+                self.tcp_cwnd_list.append(result.tcp_snd_cwnd)
             if result.tcp_lost_packets is not None:
                 self.tcp_lost_list.append(result.tcp_lost_packets)
+            if result.tcp_reordering is not None:
+                self.tcp_reordering_list.append(result.tcp_reordering)
         else:
             self.failed += 1
+            self.total_bytes_sent += result.bytes_sent
+            self.total_retry_attempts += result.retry_attempts
+            error_text = result.error or ""
+            if error_text.startswith("RST:"):
+                self.rst_failures += 1
+            elif error_text.startswith("timeout:"):
+                self.timeout_failures += 1
+            elif error_text.startswith("refused:"):
+                self.refused_failures += 1
+            elif error_text.startswith("aborted:"):
+                self.aborted_failures += 1
+            elif error_text.startswith("broken_pipe:"):
+                self.broken_pipe_failures += 1
+            else:
+                self.other_failures += 1
 
     def summary(self) -> str:
         elapsed = time.monotonic() - self.start_time
@@ -155,11 +191,20 @@ class Stats:
         # TCP statistics summary
         if self.tcp_retransmits_list:
             total_retx = sum(self.tcp_retransmits_list)
+            retx_conns = sum(1 for v in self.tcp_retransmits_list if v > 0)
+            loss_conns = sum(1 for v in self.tcp_lost_list if v > 0)
+            avg_bytes = (self.total_bytes_sent / self.success) if self.success else 0.0
+            avg_pkts = (self.total_packets / self.success) if self.success else 0.0
             lines += [
                 "",
                 "  TCP Statistics:",
                 f"    Total retransmits : {total_retx}",
                 f"    Avg retransmits   : {total_retx/len(self.tcp_retransmits_list):.1f} per conn",
+                f"    Connections w/ retx: {retx_conns}",
+                f"    Connections w/ loss: {loss_conns}",
+                f"    Avg bytes / conn  : {avg_bytes:.1f}",
+                f"    Avg pkts / conn   : {avg_pkts:.1f}",
+                f"    Total retries     : {self.total_retry_attempts}",
             ]
         if self.tcp_rtt_list:
             avg_rtt = sum(self.tcp_rtt_list) / len(self.tcp_rtt_list)
@@ -168,12 +213,38 @@ class Stats:
                 f"    RTT min           : {min(self.tcp_rtt_list):.2f}ms",
                 f"    RTT max           : {max(self.tcp_rtt_list):.2f}ms",
             ]
+        if self.tcp_rtt_var_list:
+            lines += [
+                f"    RTT var avg       : {sum(self.tcp_rtt_var_list)/len(self.tcp_rtt_var_list):.2f}ms",
+                f"    RTT var min       : {min(self.tcp_rtt_var_list):.2f}ms",
+                f"    RTT var max       : {max(self.tcp_rtt_var_list):.2f}ms",
+            ]
+        if self.tcp_cwnd_list:
+            lines += [
+                f"    CWND avg          : {sum(self.tcp_cwnd_list)/len(self.tcp_cwnd_list):.2f}",
+                f"    CWND min          : {min(self.tcp_cwnd_list)}",
+                f"    CWND max          : {max(self.tcp_cwnd_list)}",
+            ]
+        if self.tcp_reordering_list:
+            lines += [
+                f"    Reordering avg    : {sum(self.tcp_reordering_list)/len(self.tcp_reordering_list):.2f}",
+                f"    Reordering max    : {max(self.tcp_reordering_list)}",
+            ]
         if self.tcp_lost_list:
             total_lost = sum(self.tcp_lost_list)
             if total_lost > 0:
                 lines += [
                     f"    Total lost packets: {total_lost}",
                 ]
+        if self.failed:
+            lines += [
+                f"    Failures RST      : {self.rst_failures}",
+                f"    Failures timeout  : {self.timeout_failures}",
+                f"    Failures refused  : {self.refused_failures}",
+                f"    Failures aborted  : {self.aborted_failures}",
+                f"    Failures broken   : {self.broken_pipe_failures}",
+                f"    Failures other    : {self.other_failures}",
+            ]
 
         lines.append("=" * 55)
         return "\n".join(lines)
@@ -362,14 +433,14 @@ def apply_keepalive(sock: socket.socket) -> None:
     apply_tcp_optimizations(sock)
 
 
-def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[int]]:
+def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], Optional[float], Optional[int], Optional[int], Optional[int]]:
     """
     Retrieve TCP socket statistics (Linux only).
-    Returns: (retransmits, rtt_ms, lost_packets)
+    Returns: (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost_packets, reordering)
     """
     system = platform.system()
     if system != "Linux":
-        return (None, None, None)
+        return (None, None, None, None, None, None)
 
     try:
         # TCP_INFO socket option (Linux-specific)
@@ -384,14 +455,18 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
 
         retransmits = struct.unpack_from('B', tcp_info, 2)[0]   # tcpi_retransmits (u8)
         rtt_us = struct.unpack_from('I', tcp_info, 68)[0]       # tcpi_rtt (u32, microseconds)
+        rtt_var_us = struct.unpack_from('I', tcp_info, 72)[0]   # tcpi_rttvar (u32, microseconds)
+        snd_cwnd = struct.unpack_from('I', tcp_info, 80)[0]     # tcpi_snd_cwnd (u32)
         lost = struct.unpack_from('I', tcp_info, 32)[0]         # tcpi_lost (u32)
+        reordering = struct.unpack_from('I', tcp_info, 88)[0]   # tcpi_reordering (u32)
 
         # Convert microseconds to milliseconds
         rtt_ms = rtt_us / 1000.0 if rtt_us > 0 else None
+        rtt_var_ms = rtt_var_us / 1000.0 if rtt_var_us > 0 else None
 
-        return (retransmits, rtt_ms, lost)
+        return (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost, reordering)
     except Exception:
-        return (None, None, None)
+        return (None, None, None, None, None, None)
 
 
 async def tcp_file_transfer(conn_id: int, host: str, port: int,
@@ -400,6 +475,8 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
     """Send a file over TCP with a checksum header; report PASS/FAIL."""
     t0 = time.monotonic()
     result: Optional[ConnectionResult] = None
+    bytes_sent = 0
+    retry_attempts = 0
     try:
         # Use retry logic for connection establishment
         reader, writer = await connect_with_retry(host, port, timeout, max_retries=3, conn_id=conn_id)
@@ -410,7 +487,6 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         latency_ms = (time.monotonic() - t0) * 1000
 
         # Send header then file data in chunks
-        bytes_sent = 0
         writer.write(header)
         bytes_sent += len(header)
         await writer.drain()
@@ -428,7 +504,7 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         response_str = response.decode(errors="replace").strip()
 
         # Collect TCP statistics before closing
-        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
+        tcp_retx, tcp_rtt, tcp_rtt_var, tcp_cwnd, tcp_lost, tcp_reordering = get_tcp_info(sock) if sock else (None, None, None, None, None, None)
 
         writer.close()
         try:
@@ -449,8 +525,10 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
             print(msg)
             result = ConnectionResult(conn_id=conn_id, success=True,
                                       latency_ms=latency_ms, packets_sent=1, bytes_sent=bytes_sent,
+                                      retry_attempts=retry_attempts,
                                       tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
-                                      tcp_lost_packets=tcp_lost)
+                                      tcp_rtt_var_ms=tcp_rtt_var, tcp_snd_cwnd=tcp_cwnd,
+                                      tcp_lost_packets=tcp_lost, tcp_reordering=tcp_reordering)
 
             # Update dashboard if enabled
             if dashboard_tracker:
@@ -468,45 +546,45 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | RST: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"RST: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"RST: {e}")
     except ConnectionRefusedError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | refused: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"refused: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"refused: {e}")
     except ConnectionAbortedError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | aborted: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"aborted: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"aborted: {e}")
     except BrokenPipeError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | broken_pipe: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"broken_pipe: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"broken_pipe: {e}")
     except asyncio.TimeoutError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | timeout: {e}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=f"timeout: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"timeout: {e}")
     except OSError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         error_detail = f"error:{e.errno}" if hasattr(e, 'errno') else str(e)
         print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         error_detail = f"{type(e).__name__}: {e}"
         print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | {error_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
     if result is not None:
         stats.record(result)
         # Update dashboard for failed file transfers
@@ -520,6 +598,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     t0 = time.monotonic()
     packets_sent = 0
     bytes_sent = 0
+    retry_attempts = 0
     pps = args.pps if args else 0
     result: Optional[ConnectionResult] = None
     try:
@@ -557,7 +636,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 await asyncio.sleep(duration)
 
         # Collect TCP statistics before closing
-        tcp_retx, tcp_rtt, tcp_lost = get_tcp_info(sock) if sock else (None, None, None)
+        tcp_retx, tcp_rtt, tcp_rtt_var, tcp_cwnd, tcp_lost, tcp_reordering = get_tcp_info(sock) if sock else (None, None, None, None, None, None)
 
         writer.close()
         try:
@@ -567,8 +646,10 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
 
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent,
+                                  retry_attempts=retry_attempts,
                                   tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
-                                  tcp_lost_packets=tcp_lost)
+                                  tcp_rtt_var_ms=tcp_rtt_var, tcp_snd_cwnd=tcp_cwnd,
+                                  tcp_lost_packets=tcp_lost, tcp_reordering=tcp_reordering)
 
         # Update dashboard if enabled
         if dashboard_tracker:
