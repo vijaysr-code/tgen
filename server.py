@@ -271,8 +271,6 @@ class ServerStats:
                 total_lost = sum(r.tcp_lost_packets for r in tcp_records if r.tcp_lost_packets is not None)
                 rtt_vals = [r.tcp_rtt_ms for r in tcp_records if r.tcp_rtt_ms is not None]
                 rtt_var_vals = [r.tcp_rtt_var_ms for r in tcp_records if r.tcp_rtt_var_ms is not None]
-                cwnd_vals = [r.tcp_snd_cwnd for r in tcp_records if r.tcp_snd_cwnd is not None]
-                reordering_vals = [r.tcp_reordering for r in tcp_records if r.tcp_reordering is not None]
                 tcp_all_records = [r for r in self.records if ":" in r.client_addr]
                 tcp_retx_conns = sum(1 for r in tcp_records if (r.tcp_retransmits or 0) > 0)
                 tcp_loss_conns = sum(1 for r in tcp_records if (r.tcp_lost_packets or 0) > 0)
@@ -304,13 +302,6 @@ class ServerStats:
                     lines.append(f"    RTT var avg       : {sum(rtt_var_vals)/len(rtt_var_vals):.2f}ms")
                     lines.append(f"    RTT var min       : {min(rtt_var_vals):.2f}ms")
                     lines.append(f"    RTT var max       : {max(rtt_var_vals):.2f}ms")
-                if cwnd_vals:
-                    lines.append(f"    CWND avg          : {sum(cwnd_vals)/len(cwnd_vals):.2f}")
-                    lines.append(f"    CWND min          : {min(cwnd_vals)}")
-                    lines.append(f"    CWND max          : {max(cwnd_vals)}")
-                if reordering_vals:
-                    lines.append(f"    Reordering avg    : {sum(reordering_vals)/len(reordering_vals):.2f}")
-                    lines.append(f"    Reordering max    : {max(reordering_vals)}")
                 lines.append(f"    Disconnect normal : {disconnect_normal}")
                 lines.append(f"    Disconnect RST    : {disconnect_rst}")
                 lines.append(f"    Disconnect aborted: {disconnect_aborted}")

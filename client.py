@@ -219,17 +219,6 @@ class Stats:
                 f"    RTT var min       : {min(self.tcp_rtt_var_list):.2f}ms",
                 f"    RTT var max       : {max(self.tcp_rtt_var_list):.2f}ms",
             ]
-        if self.tcp_cwnd_list:
-            lines += [
-                f"    CWND avg          : {sum(self.tcp_cwnd_list)/len(self.tcp_cwnd_list):.2f}",
-                f"    CWND min          : {min(self.tcp_cwnd_list)}",
-                f"    CWND max          : {max(self.tcp_cwnd_list)}",
-            ]
-        if self.tcp_reordering_list:
-            lines += [
-                f"    Reordering avg    : {sum(self.tcp_reordering_list)/len(self.tcp_reordering_list):.2f}",
-                f"    Reordering max    : {max(self.tcp_reordering_list)}",
-            ]
         if self.tcp_lost_list:
             total_lost = sum(self.tcp_lost_list)
             if total_lost > 0:
