@@ -923,7 +923,7 @@ def _port_type(value: str) -> int:
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Traffic Generator Server — receives TCP/UDP connections and collects stats.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_SERVER_HELP_EPILOG,
     )
     parser.add_argument("--host", default="0.0.0.0", help="Address to bind on")

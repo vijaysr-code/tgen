@@ -999,6 +999,7 @@ async def run_client(args):
             if pending:
                 print(f"Warning: {len(pending)} tasks did not finish gracefully within timeout.", file=sys.stderr)
         print(stats.summary())
+        sys.stdout.flush()  # Ensure summary is written to file when using --output
         
         # Stop dashboard reporting
         if dashboard_task:
