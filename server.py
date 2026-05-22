@@ -14,6 +14,7 @@ import resource
 import signal
 import socket
 import sys
+import textwrap
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -518,6 +519,25 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
         )
 
 
+async def _read_normal_tcp_stream(reader: asyncio.StreamReader, initial_buf: bytes) -> tuple[int, int]:
+    """Read a normal TCP stream and return total bytes and message count."""
+    total_bytes = 0
+    message_count = 0
+
+    if initial_buf:
+        total_bytes += len(initial_buf)
+        message_count += 1
+
+    while True:
+        data = await reader.read(65536)
+        if not data:
+            break
+        total_bytes += len(data)
+        message_count += 1
+
+    return total_bytes, message_count
+
+
 async def handle_tcp_client(reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
                              stats: ServerStats,
@@ -538,7 +558,14 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
     if dashboard_tracker:
         dashboard_tracker.record_connection()
 
-    disconnect_reason = "normal"  # Track disconnect reason
+    disconnect_reason = "normal"
+    exception_reason_map = {
+        ConnectionResetError: "RST",
+        ConnectionAbortedError: "aborted",
+        BrokenPipeError: "broken_pipe",
+        asyncio.IncompleteReadError: "incomplete",
+    }
+
     try:
         # buffer enough bytes to determine if it's a file header
         prefix_len = len(_FILE_HEADER_PREFIX)
@@ -556,32 +583,17 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
             # File-transfer mode: pass the buffered header prefix along
             await _handle_file_transfer(reader, writer, rec, buf)
         elif buf:
-            # Normal traffic mode: count what we buffered, then keep reading
-            rec.bytes_received += len(buf)
-            rec.messages_received += 1
-            while True:
-                data = await reader.read(65536)
-                if not data:
-                    break
-                rec.bytes_received += len(data)
-                rec.messages_received += 1
-    except ConnectionResetError:
-        disconnect_reason = "RST"
-    except ConnectionAbortedError:
-        disconnect_reason = "aborted"
-    except BrokenPipeError:
-        disconnect_reason = "broken_pipe"
-    except asyncio.IncompleteReadError:
-        disconnect_reason = "incomplete"
-    except OSError as e:
-        # Catch other OS-level socket errors
-        disconnect_reason = f"error:{e.errno}" if hasattr(e, 'errno') else "error"
+            rec.bytes_received, rec.messages_received = await _read_normal_tcp_stream(reader, buf)
     except asyncio.CancelledError:
         disconnect_reason = "cancelled"
         raise  # Re-raise to allow proper cleanup
     except Exception as e:
-        # Catch any unexpected errors
-        disconnect_reason = f"exception:{type(e).__name__}"
+        disconnect_reason = exception_reason_map.get(type(e))
+        if disconnect_reason is None:
+            if isinstance(e, OSError):
+                disconnect_reason = f"error:{e.errno}" if hasattr(e, 'errno') else "error"
+            else:
+                disconnect_reason = f"exception:{type(e).__name__}"
     finally:
         # Collect TCP statistics before closing
         if sock is not None:
@@ -596,12 +608,12 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
         rec.disconnect_reason = disconnect_reason
         rec.disconnect_time = time.monotonic()
         dur = rec.duration if rec.duration is not None else 0.0
-        timestamp = _format_timestamp()
+        disconnect_timestamp = _format_timestamp()
         
         # Enhanced disconnect message with TCP stats and disconnect reason
         reason_suffix = f" ({disconnect_reason})" if disconnect_reason != "normal" else ""
         disconnect_msg = (
-            f"[{timestamp}] [{rec.conn_id:>6}] TCP disconnect | {addr_str} | "
+            f"[{disconnect_timestamp}] [{rec.conn_id:>6}] TCP disconnect | {addr_str} | "
             f"dur={dur:.3f}s | {rec.bytes_received}B{reason_suffix}"
         )
         if rec.tcp_retransmits is not None:
@@ -863,19 +875,19 @@ async def run_server(args):
         pass
 
 
-def parse_args():
-    epilog = """\
+_SERVER_HELP_EPILOG = textwrap.dedent("""\
 SYNTAX
 ------
   python server.py --port PORT [options]
 
 OPTIONS
 -------
-  --host HOST           Address to bind on (default: 0.0.0.0)
+  --host HOST           Address to bind on
   --port PORT           Port to listen on (required)
-  --protocol {tcp,udp}  Protocol to use (default: tcp)
+  --protocol {tcp,udp}  Protocol to use
   --output PATH         Optional file path to log the output results
   --quiet               Suppress per-connection messages (still written to output file)
+  --dashboard URL       Dashboard metrics API URL
   -h, --help            Show this help message and exit
 
 NOTES
@@ -884,6 +896,7 @@ NOTES
     (idle=10s, interval=10s, count=5).
   * UDP sessions are tracked per unique (host, port) pair and expire after
     5 seconds of inactivity.
+  * Default values are shown automatically in the argparse options list.
   * Press Ctrl+C to stop the server and print the full statistics summary.
 
 EXAMPLES
@@ -896,19 +909,27 @@ EXAMPLES
 
   # TCP server bound to a specific interface, logging output to a file
   python server.py --host 192.168.1.10 --port 9000 --output server.log
-"""
+""")
+
+
+def _port_type(value: str) -> int:
+    """Validate TCP/UDP port numbers."""
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be in range 1-65535")
+    return port
+
+
+def parse_args():
     parser = argparse.ArgumentParser(
         description="Traffic Generator Server — receives TCP/UDP connections and collects stats.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=epilog,
-        add_help=False,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=_SERVER_HELP_EPILOG,
     )
-    parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS,
-                        help="Show this help message and exit")
-    parser.add_argument("--host", default="0.0.0.0", help="Address to bind on (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, required=True, help="Port to listen on (required)")
+    parser.add_argument("--host", default="0.0.0.0", help="Address to bind on")
+    parser.add_argument("--port", type=_port_type, required=True, help="Port to listen on")
     parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp",
-                        help="Protocol to use: tcp or udp (default: tcp)")
+                        help="Protocol to use")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")
     parser.add_argument("--quiet", action="store_true",

@@ -154,7 +154,7 @@ class Stats:
             error_text = result.error or ""
             if error_text.startswith("RST:"):
                 self.rst_failures += 1
-            elif error_text.startswith("timeout:"):
+            elif error_text.startswith("timeout "):
                 self.timeout_failures += 1
             elif error_text.startswith("refused:"):
                 self.refused_failures += 1
@@ -262,6 +262,27 @@ def calculate_timeout(cps: float) -> float:
         return 30.0   # Low rate: 30 seconds (default)
 
 
+def _format_timeout_detail(phase: str, host: str, port: int, timeout: float,
+                           elapsed_ms: float, attempt: Optional[int] = None,
+                           max_retries: Optional[int] = None,
+                           bytes_sent: Optional[int] = None,
+                           packets_sent: Optional[int] = None) -> str:
+    """Build a detailed timeout message for logging and summaries."""
+    parts = [
+        f"timeout phase={phase}",
+        f"target={host}:{port}",
+        f"timeout={timeout:.1f}s",
+        f"elapsed={elapsed_ms:.1f}ms",
+    ]
+    if attempt is not None and max_retries is not None:
+        parts.append(f"attempt={attempt}/{max_retries}")
+    if bytes_sent is not None:
+        parts.append(f"bytes_sent={bytes_sent}")
+    if packets_sent is not None:
+        parts.append(f"packets_sent={packets_sent}")
+    return " | ".join(parts)
+
+
 async def connect_with_retry(host: str, port: int, timeout: float,
                              max_retries: int = 3, conn_id: int = 0) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """
@@ -327,11 +348,21 @@ async def connect_with_retry(host: str, port: int, timeout: float,
         except asyncio.TimeoutError as e:
             last_error = e
             timestamp = _format_timestamp()
+            elapsed_ms = timeout * 1000
+            timeout_detail = _format_timeout_detail(
+                phase="connect",
+                host=host,
+                port=port,
+                timeout=timeout,
+                elapsed_ms=elapsed_ms,
+                attempt=attempt + 1,
+                max_retries=max_retries,
+            )
             if attempt < max_retries - 1:
-                print(f"[{timestamp}] [{conn_id:>6}] ✗ Timeout on attempt {attempt + 1}/{max_retries}")
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ {timeout_detail}")
             else:
                 # Final attempt failed
-                print(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with timeout")
+                print(f"[{timestamp}] [{conn_id:>6}] ✗ All attempts failed | {timeout_detail}")
                 raise
         
         except ConnectionResetError as e:
@@ -557,9 +588,18 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
     except asyncio.TimeoutError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | target={host}:{port} | timeout: {e}")
+        timeout_detail = _format_timeout_detail(
+            phase="file_transfer",
+            host=host,
+            port=port,
+            timeout=timeout,
+            elapsed_ms=latency_ms,
+            bytes_sent=bytes_sent,
+            packets_sent=1 if bytes_sent > 0 else 0,
+        )
+        print(f"[{timestamp}] [{conn_id:>6}] TCP file FAILED | {timeout_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"timeout: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=timeout_detail)
     except OSError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -599,19 +639,24 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         if sock is not None:
             apply_tcp_optimizations(sock)
 
-        latency_ms = (time.monotonic() - t0) * 1000
+        now = time.monotonic()
+        latency_ms = (now - t0) * 1000
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
 
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
-            deadline = time.monotonic() + duration
-            while time.monotonic() < deadline:
+            deadline = now + duration
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    break
                 writer.write(payload)
                 bytes_sent += len(payload)
                 await writer.drain()
                 packets_sent += 1
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = deadline - now
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval, remaining))
@@ -670,9 +715,18 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     except asyncio.TimeoutError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | timeout: {e}")
+        timeout_detail = _format_timeout_detail(
+            phase="traffic",
+            host=host,
+            port=port,
+            timeout=timeout,
+            elapsed_ms=latency_ms,
+            bytes_sent=bytes_sent,
+            packets_sent=packets_sent,
+        )
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | {timeout_detail}")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"timeout: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=timeout_detail)
     except OSError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -727,14 +781,18 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 pass  # Ignore if system doesn't allow buffer size changes
         
         # Capture latency right after endpoint creation (before any sends)
-        latency_ms = (time.monotonic() - t0) * 1000
+        now = time.monotonic()
+        latency_ms = (now - t0) * 1000
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
-            deadline = time.monotonic() + duration
+            deadline = now + duration
             # Calculate expected packet count
             expected_packets = int(duration * pps)
             seq_num = 0
-            while time.monotonic() < deadline:
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    break
                 # Prepend sequence number (4 bytes) and expected total (4 bytes) to payload
                 import struct
                 packet = struct.pack('!II', seq_num, expected_packets) + payload
@@ -742,7 +800,8 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 bytes_sent += len(packet)
                 packets_sent += 1
                 seq_num += 1
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = deadline - now
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval, remaining))
