@@ -94,8 +94,9 @@ class Tee:
             self.file.close()
 
 
-@dataclass
+@dataclass(slots=True)
 class ConnectionRecord:
+    """Connection record with __slots__ for memory efficiency (Python 3.10+)."""
     conn_id: int
     client_addr: str
     connect_time: float

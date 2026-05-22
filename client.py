@@ -681,9 +681,11 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
 
-        # Calculate transfer-specific timeout to avoid false positives on long-duration connections
-        # Use max of connection timeout or duration + 10s buffer
-        transfer_timeout = max(timeout, duration + 10.0) if duration > 0 else timeout
+        # Calculate per-operation timeout for drain() calls
+        # This should be generous to handle slow networks, but detect actual hangs
+        # Use the connection timeout (30-120s based on CPS), not duration-based
+        # Duration controls how long the connection stays open, not individual operations
+        drain_timeout = timeout
 
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
@@ -695,7 +697,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 writer.write(payload)
                 bytes_sent += len(payload)
                 # Apply timeout to detect server hangs during data transfer
-                await asyncio.wait_for(writer.drain(), timeout=transfer_timeout)
+                await asyncio.wait_for(writer.drain(), timeout=drain_timeout)
                 packets_sent += 1
                 now = time.monotonic()
                 remaining = deadline - now
@@ -707,7 +709,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             writer.write(payload)
             bytes_sent += len(payload)
             # Apply timeout to detect server hangs during data transfer
-            await asyncio.wait_for(writer.drain(), timeout=transfer_timeout)
+            await asyncio.wait_for(writer.drain(), timeout=drain_timeout)
             packets_sent = 1
             if duration > 0:
                 await asyncio.sleep(duration)
