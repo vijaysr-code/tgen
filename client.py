@@ -536,10 +536,16 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
 
         latency_ms = (time.monotonic() - t0) * 1000
 
+        # Calculate transfer timeout based on file size (assume 1MB/s minimum transfer rate)
+        # Use max of connection timeout or estimated transfer time + 30s buffer
+        estimated_transfer_time = size / (1024 * 1024)  # seconds at 1MB/s
+        transfer_timeout = max(timeout, estimated_transfer_time + 30.0)
+
         # Send header then file data in chunks
         writer.write(header)
         bytes_sent += len(header)
-        await writer.drain()
+        # Apply timeout to detect server hangs during file transfer
+        await asyncio.wait_for(writer.drain(), timeout=transfer_timeout)
 
         # Send file data in 64KB chunks to avoid blocking the event loop
         chunk_size = 65536
@@ -547,7 +553,8 @@ async def tcp_file_transfer(conn_id: int, host: str, port: int,
             chunk = file_data[i:i + chunk_size]
             writer.write(chunk)
             bytes_sent += len(chunk)
-            await writer.drain()
+            # Apply timeout to detect server hangs during file transfer
+            await asyncio.wait_for(writer.drain(), timeout=transfer_timeout)
 
         # Read server response: "OK\n" or "FAIL:<reason>\n"
         response = await asyncio.wait_for(reader.readline(), timeout=timeout)
@@ -674,6 +681,10 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         timestamp = _format_timestamp()
         print(f"[{timestamp}] [{conn_id:>6}] TCP connected  | latency={latency_ms:.1f}ms ka=on")
 
+        # Calculate transfer-specific timeout to avoid false positives on long-duration connections
+        # Use max of connection timeout or duration + 10s buffer
+        transfer_timeout = max(timeout, duration + 10.0) if duration > 0 else timeout
+
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
             deadline = now + duration
@@ -683,7 +694,8 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                     break
                 writer.write(payload)
                 bytes_sent += len(payload)
-                await writer.drain()
+                # Apply timeout to detect server hangs during data transfer
+                await asyncio.wait_for(writer.drain(), timeout=transfer_timeout)
                 packets_sent += 1
                 now = time.monotonic()
                 remaining = deadline - now
@@ -694,7 +706,8 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             # Single send (original behaviour)
             writer.write(payload)
             bytes_sent += len(payload)
-            await writer.drain()
+            # Apply timeout to detect server hangs during data transfer
+            await asyncio.wait_for(writer.drain(), timeout=transfer_timeout)
             packets_sent = 1
             if duration > 0:
                 await asyncio.sleep(duration)
