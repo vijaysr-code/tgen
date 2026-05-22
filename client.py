@@ -30,11 +30,21 @@ except ImportError:
     DASHBOARD_AVAILABLE = False
 
 
+# Timestamp cache for performance optimization
+_TIMESTAMP_CACHE = {}
+
 def _format_timestamp() -> str:
-    """Fast timestamp formatting for logging. Returns ISO-8601 format with milliseconds."""
+    """Optimized timestamp formatting with caching. Returns ISO-8601 format with milliseconds."""
     t = time.time()
+    sec = int(t)
+    # Cache the formatted second to avoid repeated strftime calls
+    if sec not in _TIMESTAMP_CACHE:
+        _TIMESTAMP_CACHE[sec] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sec))
+        # Keep cache small (last 60 seconds)
+        if len(_TIMESTAMP_CACHE) > 60:
+            _TIMESTAMP_CACHE.clear()
     ms = int((t % 1) * 1000)
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + f".{ms:03d}"
+    return f"{_TIMESTAMP_CACHE[sec]}.{ms:03d}"
 
 # Maximum allowed file size for -F / --file transfers (128 MiB)
 _MAX_FILE_SIZE = 128 * 1024 * 1024
@@ -86,8 +96,9 @@ class Tee:
             self.file.close()
 
 
-@dataclass
+@dataclass(slots=True)
 class ConnectionResult:
+    """Connection result with __slots__ for memory efficiency (Python 3.10+)."""
     conn_id: int
     success: bool
     latency_ms: float
@@ -126,46 +137,65 @@ class Stats:
     aborted_failures: int = 0
     broken_pipe_failures: int = 0
     other_failures: int = 0
+    # Batch processing for performance
+    _batch_buffer: List[ConnectionResult] = field(default_factory=list)
+    _batch_size: int = 100
 
     def record(self, result: ConnectionResult):
-        self.total += 1
-        if result.success:
-            self.success += 1
-            self.latencies.append(result.latency_ms)
-            self.total_packets += result.packets_sent
-            self.total_bytes_sent += result.bytes_sent
-            self.total_retry_attempts += result.retry_attempts
-            if result.tcp_retransmits is not None:
-                self.tcp_retransmits_list.append(result.tcp_retransmits)
-            if result.tcp_rtt_ms is not None:
-                self.tcp_rtt_list.append(result.tcp_rtt_ms)
-            if result.tcp_rtt_var_ms is not None:
-                self.tcp_rtt_var_list.append(result.tcp_rtt_var_ms)
-            if result.tcp_snd_cwnd is not None:
-                self.tcp_cwnd_list.append(result.tcp_snd_cwnd)
-            if result.tcp_lost_packets is not None:
-                self.tcp_lost_list.append(result.tcp_lost_packets)
-            if result.tcp_reordering is not None:
-                self.tcp_reordering_list.append(result.tcp_reordering)
-        else:
-            self.failed += 1
-            self.total_bytes_sent += result.bytes_sent
-            self.total_retry_attempts += result.retry_attempts
-            error_text = result.error or ""
-            if error_text.startswith("RST:"):
-                self.rst_failures += 1
-            elif error_text.startswith("timeout "):
-                self.timeout_failures += 1
-            elif error_text.startswith("refused:"):
-                self.refused_failures += 1
-            elif error_text.startswith("aborted:"):
-                self.aborted_failures += 1
-            elif error_text.startswith("broken_pipe:"):
-                self.broken_pipe_failures += 1
+        """Record connection result with batch processing for performance."""
+        self._batch_buffer.append(result)
+        if len(self._batch_buffer) >= self._batch_size:
+            self._flush_batch()
+    
+    def _flush_batch(self):
+        """Process all buffered results at once for better performance."""
+        for result in self._batch_buffer:
+            self.total += 1
+            if result.success:
+                self.success += 1
+                self.latencies.append(result.latency_ms)
+                self.total_packets += result.packets_sent
+                self.total_bytes_sent += result.bytes_sent
+                self.total_retry_attempts += result.retry_attempts
+                if result.tcp_retransmits is not None:
+                    self.tcp_retransmits_list.append(result.tcp_retransmits)
+                if result.tcp_rtt_ms is not None:
+                    self.tcp_rtt_list.append(result.tcp_rtt_ms)
+                if result.tcp_rtt_var_ms is not None:
+                    self.tcp_rtt_var_list.append(result.tcp_rtt_var_ms)
+                if result.tcp_snd_cwnd is not None:
+                    self.tcp_cwnd_list.append(result.tcp_snd_cwnd)
+                if result.tcp_lost_packets is not None:
+                    self.tcp_lost_list.append(result.tcp_lost_packets)
+                if result.tcp_reordering is not None:
+                    self.tcp_reordering_list.append(result.tcp_reordering)
             else:
-                self.other_failures += 1
+                self.failed += 1
+                self.total_bytes_sent += result.bytes_sent
+                self.total_retry_attempts += result.retry_attempts
+                error_text = result.error or ""
+                if error_text.startswith("RST:"):
+                    self.rst_failures += 1
+                elif error_text.startswith("timeout "):
+                    self.timeout_failures += 1
+                elif error_text.startswith("refused:"):
+                    self.refused_failures += 1
+                elif error_text.startswith("aborted:"):
+                    self.aborted_failures += 1
+                elif error_text.startswith("broken_pipe:"):
+                    self.broken_pipe_failures += 1
+                else:
+                    self.other_failures += 1
+        self._batch_buffer.clear()
+    
+    def finalize(self):
+        """Flush any remaining buffered results before generating summary."""
+        if self._batch_buffer:
+            self._flush_batch()
 
     def summary(self) -> str:
+        """Generate summary statistics. Flushes any pending batch updates first."""
+        self.finalize()  # Flush any remaining buffered results
         elapsed = time.monotonic() - self.start_time
         rate = self.total / elapsed if elapsed > 0 else 0
         lines = [
@@ -998,7 +1028,8 @@ async def run_client(args):
             _, pending = await asyncio.wait(tasks, timeout=3.0)
             if pending:
                 print(f"Warning: {len(pending)} tasks did not finish gracefully within timeout.", file=sys.stderr)
-        print(stats.summary())
+        summary_output = stats.summary()
+        print(summary_output)
         sys.stdout.flush()  # Ensure summary is written to file when using --output
         
         # Stop dashboard reporting

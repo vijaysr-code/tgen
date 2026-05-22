@@ -32,11 +32,21 @@ except ImportError:
     DASHBOARD_AVAILABLE = False
 
 
+# Timestamp cache for performance optimization
+_TIMESTAMP_CACHE = {}
+
 def _format_timestamp() -> str:
-    """Fast timestamp formatting for logging. Returns ISO-8601 format with milliseconds."""
+    """Optimized timestamp formatting with caching. Returns ISO-8601 format with milliseconds."""
     t = time.time()
+    sec = int(t)
+    # Cache the formatted second to avoid repeated strftime calls
+    if sec not in _TIMESTAMP_CACHE:
+        _TIMESTAMP_CACHE[sec] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sec))
+        # Keep cache small (last 60 seconds)
+        if len(_TIMESTAMP_CACHE) > 60:
+            _TIMESTAMP_CACHE.clear()
     ms = int((t % 1) * 1000)
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + f".{ms:03d}"
+    return f"{_TIMESTAMP_CACHE[sec]}.{ms:03d}"
 
 # Must match client.py constants
 _FILE_HEADER_PREFIX = b"TGEN_FILE:"
