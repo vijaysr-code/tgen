@@ -440,14 +440,34 @@ def make_file_header(path: str) -> tuple:
     return header, size, sha256
 
 
-# TCP keepalive constants (always enabled for TCP connections)
-_KA_IDLE = 10      # seconds idle before first probe
-_KA_INTERVAL = 10  # seconds between probes
-_KA_COUNT = 5      # unacked probes before dropping
+# TCP keepalive profiles
+# Standard: Default settings for stable networks (60s detection time)
+_KA_STANDARD = {
+    'idle': 10,      # seconds idle before first probe
+    'interval': 10,  # seconds between probes
+    'count': 5,      # unacked probes before dropping
+    'heartbeat': 15  # heartbeat interval in seconds
+}
+
+# Aggressive: Fast detection for lossy networks (20s detection time)
+_KA_AGGRESSIVE = {
+    'idle': 5,       # seconds idle before first probe
+    'interval': 5,   # seconds between probes
+    'count': 3,      # unacked probes before dropping
+    'heartbeat': 10  # heartbeat interval in seconds
+}
 
 
-def apply_tcp_optimizations(sock: socket.socket) -> None:
-    """Apply TCP optimizations: keepalive, nodelay, and buffer sizes."""
+def apply_tcp_optimizations(sock: socket.socket, ka_idle: int = 10, ka_interval: int = 10, ka_count: int = 5) -> None:
+    """
+    Apply TCP optimizations: keepalive, nodelay, and buffer sizes.
+    
+    Args:
+        sock: Socket to configure
+        ka_idle: Seconds idle before first keepalive probe
+        ka_interval: Seconds between keepalive probes
+        ka_count: Number of unacked probes before dropping connection
+    """
     # Enable TCP keepalive
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     
@@ -464,18 +484,18 @@ def apply_tcp_optimizations(sock: socket.socket) -> None:
     system = platform.system()
     if system == "Linux":
         if hasattr(socket, "TCP_KEEPIDLE"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KA_IDLE)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, ka_idle)
         if hasattr(socket, "TCP_KEEPINTVL"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, ka_interval)
         if hasattr(socket, "TCP_KEEPCNT"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, ka_count)
     elif system == "Darwin":  # macOS
         TCP_KEEPALIVE = 0x10  # equivalent to TCP_KEEPIDLE on macOS
-        sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, _KA_IDLE)
+        sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, ka_idle)
         if hasattr(socket, "TCP_KEEPINTVL"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTERVAL)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, ka_interval)
         if hasattr(socket, "TCP_KEEPCNT"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_COUNT)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, ka_count)
 
 
 def apply_keepalive(sock: socket.socket) -> None:
@@ -673,9 +693,13 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         reader, writer = await connect_with_retry(host, port, timeout, max_retries=3, conn_id=conn_id)
 
         # Apply TCP optimizations (keepalive, nodelay, buffers)
+        # Get keepalive settings from args
+        ka_mode = args.keepalive_mode if args and hasattr(args, 'keepalive_mode') else 'standard'
+        ka_profile = _KA_AGGRESSIVE if ka_mode == 'aggressive' else _KA_STANDARD
+        
         sock = writer.get_extra_info("socket")
         if sock is not None:
-            apply_tcp_optimizations(sock)
+            apply_tcp_optimizations(sock, ka_profile['idle'], ka_profile['interval'], ka_profile['count'])
 
         now = time.monotonic()
         latency_ms = (now - t0) * 1000
@@ -718,9 +742,10 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                 enable_heartbeat = args and hasattr(args, 'heartbeat') and args.heartbeat
                 
                 if enable_heartbeat:
-                    # Send heartbeat every 15 seconds to prevent keepalive packet loss
-                    # This ensures connection stays alive even with network issues
-                    heartbeat_interval = 15.0
+                    # Get heartbeat interval from keepalive profile
+                    ka_mode = args.keepalive_mode if args and hasattr(args, 'keepalive_mode') else 'standard'
+                    ka_profile = _KA_AGGRESSIVE if ka_mode == 'aggressive' else _KA_STANDARD
+                    heartbeat_interval = float(ka_profile['heartbeat'])
                     max_heartbeat_failures = 3  # Allow 3 consecutive failures before giving up
                     consecutive_failures = 0
                     remaining = duration
@@ -1058,7 +1083,11 @@ async def run_client(args):
         print(f"  Payload  : {len(payload)} bytes")
     print(f"  Total    : {'infinite' if args.total == 0 else args.total}")
     if args.protocol == "tcp":
-        print(f"  Keepalive: ON (idle={_KA_IDLE}s, intvl={_KA_INTERVAL}s, cnt={_KA_COUNT})")
+        ka_mode = args.keepalive_mode if hasattr(args, 'keepalive_mode') else 'standard'
+        ka_profile = _KA_AGGRESSIVE if ka_mode == 'aggressive' else _KA_STANDARD
+        print(f"  Keepalive: {ka_mode.upper()} (idle={ka_profile['idle']}s, intvl={ka_profile['interval']}s, cnt={ka_profile['count']})")
+        if hasattr(args, 'heartbeat') and args.heartbeat:
+            print(f"  Heartbeat: ON (interval={ka_profile['heartbeat']}s, max_failures=3)")
     print("-" * 55)
 
     # Use absolute deadline-based scheduling to eliminate cumulative drift
@@ -1160,7 +1189,8 @@ OPTIONS
   --payload TEXT        Payload string to send (default: PING)
   --payload-size BYTES  Random payload size in bytes; overrides --payload (default: 0)
   --pps PPS             Packets per second per connection; requires --duration > 0 (default: 0.0)
-  --heartbeat           Enable heartbeat packets every 15s when pps=0 to prevent timeout (default: disabled)
+  --keepalive-mode MODE TCP keepalive mode: standard or aggressive (default: standard)
+  --heartbeat           Enable heartbeat packets when pps=0 (default: disabled)
   -F, --file PATH       File to send over each TCP connection (max 128 MiB);
                         server verifies SHA-256 checksum per connection
   --output PATH         Optional file path to log the output results
@@ -1168,8 +1198,10 @@ OPTIONS
 
 NOTES
 -----
-  * TCP keepalive is always enabled (idle=10s, interval=10s, count=5).
-  * --heartbeat sends application-level keepalive every 15s when pps=0 (tolerates 3 failures).
+  * TCP keepalive modes:
+    - standard: idle=10s, interval=10s, count=5 (60s detection, heartbeat=15s)
+    - aggressive: idle=5s, interval=5s, count=3 (20s detection, heartbeat=10s)
+  * --heartbeat sends application-level keepalive when pps=0 (tolerates 3 failures).
   * -F/--file is TCP-only; --duration, --pps, and --payload are ignored in file mode.
   * --pps has no effect unless --duration > 0.
 
@@ -1217,8 +1249,10 @@ EXAMPLES
                         help="Random payload size in bytes; overrides --payload (default: 0)")
     parser.add_argument("--pps", type=float, default=0.0,
                         help="Packets per second per connection; requires --duration > 0 (default: 0.0)")
+    parser.add_argument("--keepalive-mode", type=str, choices=['standard', 'aggressive'], default='standard',
+                        help="TCP keepalive mode: standard (10s/10s/5, 60s detection) or aggressive (5s/5s/3, 20s detection) (default: standard)")
     parser.add_argument("--heartbeat", action="store_true", default=False,
-                        help="Enable heartbeat packets every 15s when pps=0 to prevent connection timeout (default: disabled)")
+                        help="Enable heartbeat packets when pps=0 (15s for standard, 10s for aggressive) (default: disabled)")
     parser.add_argument("-F", "--file", type=str, default=None,
                         help="File to send over each TCP connection (max 128 MiB); "
                              "server verifies SHA-256 checksum per connection")

@@ -460,7 +460,8 @@ OPTIONS
   --payload TEXT        Payload string to send (default: PING)
   --payload-size BYTES  Random payload size in bytes; overrides --payload (default: 0)
   --pps PPS             Packets per second per connection; requires --duration > 0 (default: 0.0)
-  --heartbeat           Enable heartbeat packets every 15s when pps=0 to prevent timeout (default: disabled)
+  --keepalive-mode MODE TCP keepalive mode: standard or aggressive (default: standard)
+  --heartbeat           Enable heartbeat packets when pps=0 (default: disabled)
   -F, --file PATH       File to send over each TCP connection (max 128 MiB)
   --output PATH         Optional file path to log the output results
   --processes N         Number of worker processes (default: CPU count)
@@ -473,8 +474,10 @@ NOTES
   * Uses multiple processes to bypass Python's GIL and leverage all CPU cores
   * Each worker process runs its own event loop independently
   * Provides 8-16x performance improvement on multicore systems
-  * TCP keepalive is always enabled (idle=10s, interval=10s, count=5)
-  * --heartbeat sends application-level keepalive every 15s when pps=0 (tolerates 3 failures)
+  * TCP keepalive modes:
+    - standard: idle=10s, interval=10s, count=5 (60s detection, heartbeat=15s)
+    - aggressive: idle=5s, interval=5s, count=3 (20s detection, heartbeat=10s)
+  * --heartbeat sends application-level keepalive when pps=0 (tolerates 3 failures)
   * -F/--file is TCP-only; --duration, --pps, and --payload are ignored in file mode
   * --pps has no effect unless --duration > 0
 
@@ -528,8 +531,10 @@ PERFORMANCE
                         help="Random payload size in bytes; overrides --payload (default: 0)")
     parser.add_argument("--pps", type=float, default=0.0,
                         help="Packets per second per connection; requires --duration > 0 (default: 0.0)")
+    parser.add_argument("--keepalive-mode", type=str, choices=['standard', 'aggressive'], default='standard',
+                        help="TCP keepalive mode: standard (10s/10s/5, 60s detection) or aggressive (5s/5s/3, 20s detection) (default: standard)")
     parser.add_argument("--heartbeat", action="store_true", default=False,
-                        help="Enable heartbeat packets every 15s when pps=0 to prevent connection timeout (default: disabled)")
+                        help="Enable heartbeat packets when pps=0 (15s for standard, 10s for aggressive) (default: disabled)")
     parser.add_argument("-F", "--file", type=str, default=None,
                         help="File to send over each TCP connection (max 128 MiB)")
     parser.add_argument("--output", type=str, default=None,
