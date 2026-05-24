@@ -667,6 +667,7 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     retry_attempts = 0
     pps = args.pps if args else 0
     result: Optional[ConnectionResult] = None
+    writer = None  # Declare at function scope for timeout handler
     try:
         # Use retry logic for connection establishment
         reader, writer = await connect_with_retry(host, port, timeout, max_retries=3, conn_id=conn_id)
@@ -711,8 +712,46 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             # Apply timeout to detect server hangs during data transfer
             await asyncio.wait_for(writer.drain(), timeout=drain_timeout)
             packets_sent = 1
+            
             if duration > 0:
-                await asyncio.sleep(duration)
+                # Check if heartbeat is enabled via --heartbeat flag
+                enable_heartbeat = args and hasattr(args, 'heartbeat') and args.heartbeat
+                
+                if enable_heartbeat:
+                    # Send heartbeat every 15 seconds to prevent keepalive packet loss
+                    # This ensures connection stays alive even with network issues
+                    heartbeat_interval = 15.0
+                    max_heartbeat_failures = 3  # Allow 3 consecutive failures before giving up
+                    consecutive_failures = 0
+                    remaining = duration
+                    
+                    while remaining > 0:
+                        sleep_time = min(heartbeat_interval, remaining)
+                        await asyncio.sleep(sleep_time)
+                        remaining -= sleep_time
+                        
+                        if remaining > 0:
+                            # Send small heartbeat packet to keep connection alive
+                            heartbeat = b"HeartBeat"
+                            writer.write(heartbeat)
+                            try:
+                                await asyncio.wait_for(writer.drain(), timeout=drain_timeout)
+                                packets_sent += 1
+                                bytes_sent += len(heartbeat)
+                                consecutive_failures = 0  # Reset on success
+                            except asyncio.TimeoutError:
+                                # Heartbeat failed - increment failure count
+                                consecutive_failures += 1
+                                timestamp = _format_timestamp()
+                                print(f"[{timestamp}] [{conn_id:>6}] DEBUG: Heartbeat timeout #{consecutive_failures} after {duration - remaining:.1f}s")
+                                
+                                if consecutive_failures >= max_heartbeat_failures:
+                                    # Too many consecutive failures - connection is dead
+                                    raise asyncio.TimeoutError(f"Heartbeat failed {consecutive_failures} times - connection dead")
+                                # Otherwise continue - transient network issue
+                else:
+                    # No heartbeat - just sleep for the full duration (original behavior)
+                    await asyncio.sleep(duration)
 
         # Collect TCP statistics before closing
         tcp_retx, tcp_rtt, tcp_rtt_var, tcp_cwnd, tcp_lost, tcp_reordering = get_tcp_info(sock) if sock else (None, None, None, None, None, None)
@@ -760,8 +799,34 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     except asyncio.TimeoutError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
+        
+        # Enhanced debug logging for timeout diagnosis
+        # Determine which phase timed out based on bytes_sent
+        if bytes_sent == 0:
+            if packets_sent == 0:
+                phase = "connect"  # Never established connection
+                debug_info = "Connection establishment timed out - no SYN/ACK received"
+            else:
+                phase = "send"  # Connected but first send failed
+                debug_info = f"Connected but failed to send first packet (attempted {packets_sent} sends)"
+        else:
+            phase = "drain"  # Data sent but drain() timed out
+            debug_info = f"Sent {bytes_sent} bytes ({packets_sent} packets) but drain() timed out - data may be stuck in send buffer"
+        
+        # Get TCP socket info for additional diagnostics
+        sock = None
+        try:
+            # writer is declared at function scope, safe to access
+            if writer is not None:
+                sock = writer.get_extra_info("socket")
+        except Exception:
+            pass
+        
+        tcp_retx, tcp_rtt, tcp_rtt_var, tcp_cwnd, tcp_lost, tcp_reordering = get_tcp_info(sock) if sock else (None, None, None, None, None, None)
+        
+        # Build detailed timeout message
         timeout_detail = _format_timeout_detail(
-            phase="traffic",
+            phase=phase,
             host=host,
             port=port,
             timeout=timeout,
@@ -769,9 +834,31 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             bytes_sent=bytes_sent,
             packets_sent=packets_sent,
         )
+        
+        # Log comprehensive debug information
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | {timeout_detail}")
+        print(f"[{timestamp}] [{conn_id:>6}] DEBUG: {debug_info}")
+        print(f"[{timestamp}] [{conn_id:>6}] DEBUG: bytes_sent={bytes_sent} packets_sent={packets_sent} elapsed={latency_ms:.1f}ms")
+        
+        if tcp_retx is not None or tcp_rtt is not None:
+            tcp_stats = []
+            if tcp_retx is not None:
+                tcp_stats.append(f"retx={tcp_retx}")
+            if tcp_rtt is not None:
+                tcp_stats.append(f"rtt={tcp_rtt:.1f}ms")
+            if tcp_cwnd is not None:
+                tcp_stats.append(f"cwnd={tcp_cwnd}")
+            if tcp_lost is not None:
+                tcp_stats.append(f"lost={tcp_lost}")
+            print(f"[{timestamp}] [{conn_id:>6}] DEBUG: TCP stats: {' '.join(tcp_stats)}")
+        else:
+            print(f"[{timestamp}] [{conn_id:>6}] DEBUG: TCP stats unavailable (socket may not exist)")
+        
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=timeout_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=timeout_detail,
+                                  tcp_retransmits=tcp_retx, tcp_rtt_ms=tcp_rtt,
+                                  tcp_rtt_var_ms=tcp_rtt_var, tcp_snd_cwnd=tcp_cwnd,
+                                  tcp_lost_packets=tcp_lost, tcp_reordering=tcp_reordering)
     except OSError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -1128,6 +1215,8 @@ EXAMPLES
                         help="Random payload size in bytes; overrides --payload (default: 0)")
     parser.add_argument("--pps", type=float, default=0.0,
                         help="Packets per second per connection; requires --duration > 0 (default: 0.0)")
+    parser.add_argument("--heartbeat", action="store_true", default=False,
+                        help="Enable heartbeat packets every 15s when pps=0 to prevent connection timeout (default: disabled)")
     parser.add_argument("-F", "--file", type=str, default=None,
                         help="File to send over each TCP connection (max 128 MiB); "
                              "server verifies SHA-256 checksum per connection")
