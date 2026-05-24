@@ -460,6 +460,7 @@ OPTIONS
   --payload TEXT        Payload string to send (default: PING)
   --payload-size BYTES  Random payload size in bytes; overrides --payload (default: 0)
   --pps PPS             Packets per second per connection; requires --duration > 0 (default: 0.0)
+  --heartbeat           Enable heartbeat packets every 15s when pps=0 to prevent timeout (default: disabled)
   -F, --file PATH       File to send over each TCP connection (max 128 MiB)
   --output PATH         Optional file path to log the output results
   --processes N         Number of worker processes (default: CPU count)
@@ -473,6 +474,7 @@ NOTES
   * Each worker process runs its own event loop independently
   * Provides 8-16x performance improvement on multicore systems
   * TCP keepalive is always enabled (idle=10s, interval=10s, count=5)
+  * --heartbeat sends application-level keepalive every 15s when pps=0 (tolerates 3 failures)
   * -F/--file is TCP-only; --duration, --pps, and --payload are ignored in file mode
   * --pps has no effect unless --duration > 0
 
@@ -526,6 +528,8 @@ PERFORMANCE
                         help="Random payload size in bytes; overrides --payload (default: 0)")
     parser.add_argument("--pps", type=float, default=0.0,
                         help="Packets per second per connection; requires --duration > 0 (default: 0.0)")
+    parser.add_argument("--heartbeat", action="store_true", default=False,
+                        help="Enable heartbeat packets every 15s when pps=0 to prevent connection timeout (default: disabled)")
     parser.add_argument("-F", "--file", type=str, default=None,
                         help="File to send over each TCP connection (max 128 MiB)")
     parser.add_argument("--output", type=str, default=None,
