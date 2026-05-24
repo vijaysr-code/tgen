@@ -36,7 +36,7 @@ class ProcessStats:
 
 
 def worker_process(process_id: int, args, connections_per_process: int,
-                   result_queue: mp.Queue, use_affinity: bool = False):
+                   result_queue: mp.Queue, num_processes: int = 1, use_affinity: bool = False):
     """
     Worker process that runs its own event loop
     Each process handles a portion of the total connections
@@ -53,6 +53,11 @@ def worker_process(process_id: int, args, connections_per_process: int,
     # Modify args for this worker
     worker_args = argparse.Namespace(**vars(args))
     worker_args.total = connections_per_process
+    
+    # CRITICAL: Divide CPS among workers to avoid overwhelming the server
+    # If we don't do this, each worker will try to connect at the full CPS rate,
+    # resulting in total_rate = CPS * num_processes, which causes timeouts and 0-byte connections
+    worker_args.cps = args.cps / num_processes
     
     # Suppress individual worker summary output
     # We'll aggregate all stats in the main process
@@ -235,7 +240,7 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
         
         p = mp.Process(
             target=worker_process,
-            args=(i, args, worker_connections, result_queue, use_affinity)
+            args=(i, args, worker_connections, result_queue, num_processes, use_affinity)
         )
         p.start()
         processes.append(p)
