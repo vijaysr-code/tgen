@@ -480,6 +480,33 @@ NOTES
   * --heartbeat sends application-level keepalive when pps=0 (tolerates 3 failures)
   * -F/--file is TCP-only; --duration, --pps, and --payload are ignored in file mode
   * --pps has no effect unless --duration > 0
+  * --pps accepts fractional values for low-rate traffic (see PPS REFERENCE below)
+
+PPS REFERENCE
+-------------
+  Common PPS values for different use cases:
+
+  High-Rate Traffic (Throughput Testing):
+    --pps 1000      = 1,000 packets/sec (1 ms interval)
+    --pps 100       = 100 packets/sec (10 ms interval)
+    --pps 10        = 10 packets/sec (100 ms interval)
+
+  Medium-Rate Traffic (Moderate Load):
+    --pps 1         = 1 packet/sec (1 second interval)
+    --pps 0.5       = 1 packet every 2 seconds
+    --pps 0.2       = 1 packet every 5 seconds
+
+  Low-Rate Traffic (Keepalive/NAT Traversal):
+    --pps 0.1       = 1 packet every 10 seconds (aggressive keepalive)
+    --pps 0.067     = 1 packet every 15 seconds (standard keepalive)
+    --pps 0.05      = 1 packet every 20 seconds
+    --pps 0.033     = 1 packet every 30 seconds (typical NAT timeout)
+    --pps 0.017     = 1 packet every 60 seconds (1 minute interval)
+    --pps 0.0083    = 1 packet every 2 minutes
+    --pps 0.0033    = 1 packet every 5 minutes
+
+  Formula: pps = 1 / interval_seconds
+  Example: For 45-second interval: pps = 1/45 = 0.022
 
 EXAMPLES
 --------
@@ -491,6 +518,9 @@ EXAMPLES
 
   # UDP with 16 workers, long-lived connections
   python client_multiprocess.py --port 9001 --protocol udp --cps 10000 --total 100000 --duration 2 --processes 16
+
+  # Low-rate: UDP keepalive every 30 seconds across 4 workers
+  python client_multiprocess.py --port 9001 --protocol udp --duration 300 --pps 0.033 --processes 4
 
   # File transfer with 4 workers
   python client_multiprocess.py --port 9000 --cps 1000 --total 10000 -F /path/to/file.bin --processes 4
