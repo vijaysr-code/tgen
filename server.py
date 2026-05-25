@@ -116,6 +116,7 @@ class ConnectionRecord:
     tcp_reordering: Optional[int] = None
     # UDP statistics (simple packet counting)
     udp_expected_packets: int = 0  # Expected total packets (from client)
+    udp_highest_seq: int = -1  # Highest sequence number seen
     udp_lost_packets: int = 0
 
     @property
@@ -727,37 +728,53 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         rec = self._sessions[addr]
         rec.bytes_received += len(data)
         
-        # Extract expected packet count from payload (first 8 bytes: seq_num + expected_total)
+        # Extract sequence number and interval from payload (first 8 bytes: seq_num + interval_ms)
         if len(data) >= 8:
             try:
                 import struct
-                seq_num, expected_total = struct.unpack('!II', data[:8])
+                seq_num, interval_ms = struct.unpack('!II', data[:8])
                 
-                # Store expected packet count from first packet
-                if rec.udp_expected_packets == 0:
-                    rec.udp_expected_packets = expected_total
+                # Track the highest sequence number seen
+                if seq_num > rec.udp_highest_seq:
+                    rec.udp_highest_seq = seq_num
+                
+                # Calculate dynamic timeout based on packet interval
+                # Use 3x the interval as timeout, with min 5s and max 300s
+                if interval_ms > 0:
+                    dynamic_timeout = max(5.0, min(300.0, (interval_ms / 1000.0) * 3.0))
+                else:
+                    # interval_ms == 0 means single packet or no periodic traffic
+                    # Use default timeout
+                    dynamic_timeout = self.timeout
                 
                 rec.messages_received += 1
             except Exception:
                 # If extraction fails, just count the packet
                 rec.messages_received += 1
+                dynamic_timeout = self.timeout
         else:
             # Packet too small, just count it
             rec.messages_received += 1
+            dynamic_timeout = self.timeout
 
-        # Reset inactivity timer
+        # Reset inactivity timer with dynamic timeout
         if addr in self._timers:
             self._timers[addr].cancel()
         loop = self._loop
         if loop is not None:
             self._timers[addr] = loop.call_later(
-                self.timeout, self._expire_session, addr
+                dynamic_timeout, self._expire_session, addr
             )
 
     def _expire_session(self, addr: tuple):
         rec = self._sessions.pop(addr, None)
         self._timers.pop(addr, None)
         if rec:
+            # Calculate expected packets from highest sequence number if not provided by client
+            if rec.udp_expected_packets == 0 and rec.udp_highest_seq >= 0:
+                # Sequence numbers are 0-based, so highest_seq + 1 = total expected
+                rec.udp_expected_packets = rec.udp_highest_seq + 1
+            
             # Calculate final loss: expected - received
             if rec.udp_expected_packets > 0:
                 rec.udp_lost_packets = rec.udp_expected_packets - rec.messages_received
@@ -905,8 +922,11 @@ NOTES
 -----
   * TCP keepalive is automatically enabled for all accepted TCP connections
     (idle=10s, interval=10s, count=5).
-  * UDP sessions are tracked per unique (host, port) pair and expire after
-    5 seconds of inactivity.
+  * UDP sessions are tracked per unique (host, port) pair with dynamic timeout:
+    - Timeout = 3x packet interval (min: 5s, max: 300s)
+    - Client sends interval in each packet for automatic adjustment
+    - Example: pps=0.033 (30s interval) → timeout=90s
+    - Example: pps=1 (1s interval) → timeout=5s (minimum)
   * Default values are shown automatically in the argparse options list.
   * Press Ctrl+C to stop the server and print the full statistics summary.
 
