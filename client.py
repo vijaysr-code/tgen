@@ -977,16 +977,17 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
         if pps > 0 and duration > 0:
             interval = 1.0 / pps
             deadline = now + duration
-            # Calculate expected packet count
-            expected_packets = int(duration * pps)
+            # Send interval in milliseconds so server can calculate appropriate timeout
+            interval_ms = int(interval * 1000)
             seq_num = 0
             while True:
                 now = time.monotonic()
                 if now >= deadline:
                     break
-                # Prepend sequence number (4 bytes) and expected total (4 bytes) to payload
+                # Prepend sequence number (4 bytes) and interval_ms (4 bytes) to payload
+                # Server uses interval_ms to calculate dynamic timeout: interval_ms * 3
                 import struct
-                packet = struct.pack('!II', seq_num, expected_packets) + payload
+                packet = struct.pack('!II', seq_num, interval_ms) + payload
                 transport.sendto(packet)
                 bytes_sent += len(packet)
                 packets_sent += 1
@@ -999,9 +1000,9 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             timestamp = _format_timestamp()
             print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)+8}B each")
         else:
-            # Single packet with sequence number 0 and total 1
+            # Single packet with sequence number 0 and interval_ms 0 (no periodic traffic)
             import struct
-            packet = struct.pack('!II', 0, 1) + payload
+            packet = struct.pack('!II', 0, 0) + payload
             transport.sendto(packet)
             bytes_sent += len(packet)
             packets_sent = 1
@@ -1009,32 +1010,8 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(packet)}B")
             
             if duration > 0:
-                # Check if heartbeat is enabled via --heartbeat flag
-                enable_heartbeat = args and hasattr(args, 'heartbeat') and args.heartbeat
-                
-                if enable_heartbeat:
-                    # Get heartbeat interval from keepalive profile
-                    ka_mode = args.keepalive_mode if args and hasattr(args, 'keepalive_mode') else 'standard'
-                    ka_profile = _KA_AGGRESSIVE if ka_mode == 'aggressive' else _KA_STANDARD
-                    heartbeat_interval = float(ka_profile['heartbeat'])
-                    remaining = duration
-                    seq_num = 1  # Start from 1 since initial packet was 0
-                    
-                    while remaining > 0:
-                        sleep_time = min(heartbeat_interval, remaining)
-                        await asyncio.sleep(sleep_time)
-                        remaining -= sleep_time
-                        
-                        if remaining > 0:
-                            # Send heartbeat packet with incrementing sequence number
-                            heartbeat_packet = struct.pack('!II', seq_num, 1) + b"HeartBeat"
-                            transport.sendto(heartbeat_packet)
-                            packets_sent += 1
-                            bytes_sent += len(heartbeat_packet)
-                            seq_num += 1
-                else:
-                    # No heartbeat - just sleep for the full duration (original behavior)
-                    await asyncio.sleep(duration)
+                # Just sleep for the duration
+                await asyncio.sleep(duration)
 
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent)
@@ -1261,7 +1238,8 @@ NOTES
   * TCP keepalive modes:
     - standard: idle=10s, interval=10s, count=5 (60s detection, heartbeat=15s)
     - aggressive: idle=5s, interval=5s, count=3 (20s detection, heartbeat=10s)
-  * --heartbeat sends application-level keepalive when pps=0 (tolerates 3 failures).
+  * --heartbeat sends application-level keepalive for TCP when pps=0 (tolerates 3 failures).
+  * UDP sessions use dynamic timeout on server: 3x packet interval (min 5s, max 300s).
   * -F/--file is TCP-only; --duration, --pps, and --payload are ignored in file mode.
   * --pps has no effect unless --duration > 0.
   * --pps accepts fractional values for low-rate traffic (see PPS REFERENCE below).
