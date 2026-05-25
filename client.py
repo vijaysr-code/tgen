@@ -313,6 +313,28 @@ def _format_timeout_detail(phase: str, host: str, port: int, timeout: float,
     return " | ".join(parts)
 
 
+def _format_debug_log(conn_id: int, message: str, **kwargs) -> str:
+    """
+    Format a structured debug log entry with consistent formatting.
+    
+    Args:
+        conn_id: Connection ID
+        message: Main debug message
+        **kwargs: Additional key-value pairs to include in the log
+    
+    Returns:
+        Formatted debug log string
+    """
+    timestamp = _format_timestamp()
+    parts = [f"[{timestamp}] [{conn_id:>6}] DEBUG: {message}"]
+    
+    if kwargs:
+        details = " | ".join(f"{k}={v}" for k, v in kwargs.items())
+        parts.append(f" | {details}")
+    
+    return "".join(parts)
+
+
 async def connect_with_retry(host: str, port: int, timeout: float,
                              max_retries: int = 3, conn_id: int = 0) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """
@@ -767,8 +789,12 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
                             except asyncio.TimeoutError:
                                 # Heartbeat failed - increment failure count
                                 consecutive_failures += 1
-                                timestamp = _format_timestamp()
-                                print(f"[{timestamp}] [{conn_id:>6}] DEBUG: Heartbeat timeout #{consecutive_failures} after {duration - remaining:.1f}s")
+                                print(_format_debug_log(
+                                    conn_id,
+                                    f"Heartbeat timeout #{consecutive_failures}",
+                                    elapsed=f"{duration - remaining:.1f}s",
+                                    max_failures=max_heartbeat_failures
+                                ))
                                 
                                 if consecutive_failures >= max_heartbeat_failures:
                                     # Too many consecutive failures - connection is dead
@@ -860,24 +886,32 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             packets_sent=packets_sent,
         )
         
-        # Log comprehensive debug information
+        # Log failure with timeout details
         print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | {timeout_detail}")
-        print(f"[{timestamp}] [{conn_id:>6}] DEBUG: {debug_info}")
-        print(f"[{timestamp}] [{conn_id:>6}] DEBUG: bytes_sent={bytes_sent} packets_sent={packets_sent} elapsed={latency_ms:.1f}ms")
         
+        # Build consolidated debug information
+        debug_parts = {
+            'phase': debug_info,
+            'bytes_sent': bytes_sent,
+            'packets_sent': packets_sent,
+            'elapsed': f"{latency_ms:.1f}ms"
+        }
+        
+        # Add TCP stats if available
         if tcp_retx is not None or tcp_rtt is not None:
-            tcp_stats = []
             if tcp_retx is not None:
-                tcp_stats.append(f"retx={tcp_retx}")
+                debug_parts['tcp_retx'] = tcp_retx
             if tcp_rtt is not None:
-                tcp_stats.append(f"rtt={tcp_rtt:.1f}ms")
+                debug_parts['tcp_rtt'] = f"{tcp_rtt:.1f}ms"
             if tcp_cwnd is not None:
-                tcp_stats.append(f"cwnd={tcp_cwnd}")
+                debug_parts['tcp_cwnd'] = tcp_cwnd
             if tcp_lost is not None:
-                tcp_stats.append(f"lost={tcp_lost}")
-            print(f"[{timestamp}] [{conn_id:>6}] DEBUG: TCP stats: {' '.join(tcp_stats)}")
+                debug_parts['tcp_lost'] = tcp_lost
         else:
-            print(f"[{timestamp}] [{conn_id:>6}] DEBUG: TCP stats unavailable (socket may not exist)")
+            debug_parts['tcp_stats'] = 'unavailable'
+        
+        # Print single consolidated debug log
+        print(_format_debug_log(conn_id, "Timeout details", **debug_parts))
         
         result = ConnectionResult(conn_id=conn_id, success=False,
                                   latency_ms=latency_ms, bytes_sent=bytes_sent, error=timeout_detail,
@@ -973,8 +1007,34 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             packets_sent = 1
             timestamp = _format_timestamp()
             print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(packet)}B")
+            
             if duration > 0:
-                await asyncio.sleep(duration)
+                # Check if heartbeat is enabled via --heartbeat flag
+                enable_heartbeat = args and hasattr(args, 'heartbeat') and args.heartbeat
+                
+                if enable_heartbeat:
+                    # Get heartbeat interval from keepalive profile
+                    ka_mode = args.keepalive_mode if args and hasattr(args, 'keepalive_mode') else 'standard'
+                    ka_profile = _KA_AGGRESSIVE if ka_mode == 'aggressive' else _KA_STANDARD
+                    heartbeat_interval = float(ka_profile['heartbeat'])
+                    remaining = duration
+                    seq_num = 1  # Start from 1 since initial packet was 0
+                    
+                    while remaining > 0:
+                        sleep_time = min(heartbeat_interval, remaining)
+                        await asyncio.sleep(sleep_time)
+                        remaining -= sleep_time
+                        
+                        if remaining > 0:
+                            # Send heartbeat packet with incrementing sequence number
+                            heartbeat_packet = struct.pack('!II', seq_num, 1) + b"HeartBeat"
+                            transport.sendto(heartbeat_packet)
+                            packets_sent += 1
+                            bytes_sent += len(heartbeat_packet)
+                            seq_num += 1
+                else:
+                    # No heartbeat - just sleep for the full duration (original behavior)
+                    await asyncio.sleep(duration)
 
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent)
@@ -1204,6 +1264,33 @@ NOTES
   * --heartbeat sends application-level keepalive when pps=0 (tolerates 3 failures).
   * -F/--file is TCP-only; --duration, --pps, and --payload are ignored in file mode.
   * --pps has no effect unless --duration > 0.
+  * --pps accepts fractional values for low-rate traffic (see PPS REFERENCE below).
+
+PPS REFERENCE
+-------------
+  Common PPS values for different use cases:
+
+  High-Rate Traffic (Throughput Testing):
+    --pps 1000      = 1,000 packets/sec (1 ms interval)
+    --pps 100       = 100 packets/sec (10 ms interval)
+    --pps 10        = 10 packets/sec (100 ms interval)
+
+  Medium-Rate Traffic (Moderate Load):
+    --pps 1         = 1 packet/sec (1 second interval)
+    --pps 0.5       = 1 packet every 2 seconds
+    --pps 0.2       = 1 packet every 5 seconds
+
+  Low-Rate Traffic (Keepalive/NAT Traversal):
+    --pps 0.1       = 1 packet every 10 seconds (aggressive keepalive)
+    --pps 0.067     = 1 packet every 15 seconds (standard keepalive)
+    --pps 0.05      = 1 packet every 20 seconds
+    --pps 0.033     = 1 packet every 30 seconds (typical NAT timeout)
+    --pps 0.017     = 1 packet every 60 seconds (1 minute interval)
+    --pps 0.0083    = 1 packet every 2 minutes
+    --pps 0.0033    = 1 packet every 5 minutes
+
+  Formula: pps = 1 / interval_seconds
+  Example: For 45-second interval: pps = 1/45 = 0.022
 
 EXAMPLES
 --------
@@ -1213,8 +1300,14 @@ EXAMPLES
   # Long-lived UDP connections (2s each) at 2/sec, 1000 total (default)
   python client.py --port 9001 --protocol udp --cps 2 --duration 2
 
-  # 100 packets/s per connection for 5 seconds, 2 connections/sec
+  # High-rate: 100 packets/s per connection for 5 seconds, 2 connections/sec
   python client.py --port 9000 --cps 2 --duration 5 --pps 100
+
+  # Low-rate: UDP keepalive every 30 seconds for 5 minutes (NAT traversal)
+  python client.py --port 9001 --protocol udp --duration 300 --pps 0.033
+
+  # Low-rate: TCP with 1 packet every 15 seconds for 10 minutes
+  python client.py --port 9000 --duration 600 --pps 0.067
 
   # 1 KB random payload, 20 connections at 10/sec
   python client.py --port 9000 --cps 10 --total 20 --payload-size 1024
