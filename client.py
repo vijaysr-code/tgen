@@ -1369,7 +1369,7 @@ def check_and_set_ulimit():
         else:
             print(f"ulimit already sufficient: {soft_limit} open files")
     except Exception as e:
-        print(f"Warning: Could not check ulimit: {e}", file=sys.stderr)
+        print(f"Warning: Could not check ulimit: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 def main():
@@ -1397,14 +1397,14 @@ def main():
         try:
             load_file_metadata(args.file)  # validate early: existence + size
         except (OSError, ValueError) as e:
-            print(f"Error: {e}", file=sys.stderr)
+            print(f"Error: {type(e).__name__}: {e}", file=sys.stderr)
             sys.exit(1)
 
     if args.output:
         try:
             sys.stdout = Tee(args.output)
         except Exception as e:
-            print(f"Error opening output file: {e}", file=sys.stderr)
+            print(f"Error opening output file: {type(e).__name__}: {e}", file=sys.stderr)
             sys.exit(1)
 
     try:
