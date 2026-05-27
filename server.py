@@ -653,7 +653,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
             # Unexpected error - log but don't crash
             if not _QUIET_MODE:
                 timestamp = _format_timestamp()
-                print(f"[{timestamp}] Warning: Cleanup error for {addr_str}: {e}")
+                print(f"[{timestamp}] Warning: Cleanup error for {addr_str}: {type(e).__name__}: {e}")
 
 
 async def run_tcp_server(host: str, port: int, stats: ServerStats, dashboard_tracker=None):
@@ -666,7 +666,8 @@ async def run_tcp_server(host: str, port: int, stats: ServerStats, dashboard_tra
             addr = w.get_extra_info("peername")
             addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
             timestamp = _format_timestamp()
-            print(f"[{timestamp}] Error handling TCP client {addr_str}: {e}")
+            # Use repr() to get full exception details including type and errno
+            print(f"[{timestamp}] Error handling TCP client {addr_str}: {type(e).__name__}: {e}")
 
     server = await asyncio.start_server(
         handler,
@@ -1005,7 +1006,7 @@ def check_and_set_ulimit():
         else:
             print(f"ulimit already sufficient: {soft_limit} open files")
     except Exception as e:
-        print(f"Warning: Could not check ulimit: {e}", file=sys.stderr)
+        print(f"Warning: Could not check ulimit: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 def main():
@@ -1025,7 +1026,7 @@ def main():
             # Also tee regular output to the file
             sys.stdout = Tee(args.output)
         except Exception as e:
-            print(f"Error opening output file: {e}", file=sys.stderr)
+            print(f"Error opening output file: {type(e).__name__}: {e}", file=sys.stderr)
             sys.exit(1)
 
     try:
