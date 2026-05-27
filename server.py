@@ -41,10 +41,10 @@ def _format_timestamp() -> str:
     sec = int(t)
     # Cache the formatted second to avoid repeated strftime calls
     if sec not in _TIMESTAMP_CACHE:
-        _TIMESTAMP_CACHE[sec] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sec))
-        # Keep cache small (last 60 seconds)
+        # Keep cache small (last 60 seconds) - clear before adding new entry
         if len(_TIMESTAMP_CACHE) > 60:
             _TIMESTAMP_CACHE.clear()
+        _TIMESTAMP_CACHE[sec] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sec))
     ms = int((t % 1) * 1000)
     return f"{_TIMESTAMP_CACHE[sec]}.{ms:03d}"
 
