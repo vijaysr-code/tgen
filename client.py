@@ -12,6 +12,7 @@ import os
 import platform
 import resource
 import socket
+import struct
 import sys
 import time
 from dataclasses import dataclass, field
@@ -947,6 +948,11 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
             )
 
 
+def _build_udp_packet(seq_num: int, interval_ms: int, payload: bytes) -> bytes:
+    """Build UDP packet with sequence number and interval header."""
+    return struct.pack('!II', seq_num, interval_ms) + payload
+
+
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                          duration: float, stats: Stats, args=None, dashboard_tracker=None):
     t0 = time.monotonic()
@@ -980,29 +986,25 @@ async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
             # Send interval in milliseconds so server can calculate appropriate timeout
             interval_ms = int(interval * 1000)
             seq_num = 0
-            while True:
-                now = time.monotonic()
-                if now >= deadline:
-                    break
+            while now < deadline:
                 # Prepend sequence number (4 bytes) and interval_ms (4 bytes) to payload
                 # Server uses interval_ms to calculate dynamic timeout: interval_ms * 3
-                import struct
-                packet = struct.pack('!II', seq_num, interval_ms) + payload
+                packet = _build_udp_packet(seq_num, interval_ms, payload)
                 transport.sendto(packet)
                 bytes_sent += len(packet)
                 packets_sent += 1
                 seq_num += 1
-                now = time.monotonic()
-                remaining = deadline - now
-                if remaining <= 0:
+                
+                next_send = now + interval
+                if next_send >= deadline:
                     break
-                await asyncio.sleep(min(interval, remaining))
+                await asyncio.sleep(next_send - time.monotonic())
+                now = time.monotonic()
             timestamp = _format_timestamp()
             print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)+8}B each")
         else:
             # Single packet with sequence number 0 and interval_ms 0 (no periodic traffic)
-            import struct
-            packet = struct.pack('!II', 0, 0) + payload
+            packet = _build_udp_packet(0, 0, payload)
             transport.sendto(packet)
             bytes_sent += len(packet)
             packets_sent = 1
