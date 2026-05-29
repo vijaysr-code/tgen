@@ -207,6 +207,7 @@ OPTIONS
   --host HOST           Address to bind on (default: 0.0.0.0)
   --port PORT           Port to listen on (required)
   --protocol {tcp,udp}  Protocol to use (default: tcp)
+  --cps CPS             Expected connections per second (for timeout calculation)
   --processes N         Number of worker processes (default: CPU count)
   --cpu-affinity        Pin each worker process to a specific CPU core (Linux only)
   --output PATH         Optional file path to log the output results
@@ -219,6 +220,7 @@ NOTES
   * Each worker process runs its own event loop on a separate CPU core
   * Provides 8-16x performance improvement on multicore systems
   * TCP keepalive is automatically enabled for all accepted TCP connections
+  * TCP read timeout is calculated based on expected CPS (30s-120s)
   * UDP sessions are tracked per unique (host, port) pair and expire after
     5 seconds of inactivity
   * Press Ctrl+C to stop all workers and print statistics
@@ -230,6 +232,9 @@ EXAMPLES
 
   # TCP server with 8 worker processes
   python server_multiprocess.py --port 9000 --processes 8
+
+  # TCP server expecting high load (90s timeout)
+  python server_multiprocess.py --port 9000 --cps 500 --processes 8
 
   # UDP server with 16 worker processes
   python server_multiprocess.py --port 9001 --protocol udp --processes 16
@@ -255,12 +260,15 @@ PERFORMANCE
     )
     parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS,
                         help="Show this help message and exit")
-    parser.add_argument("--host", default="0.0.0.0", 
+    parser.add_argument("--host", default="0.0.0.0",
                         help="Address to bind on (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, required=True, 
+    parser.add_argument("--port", type=int, required=True,
                         help="Port to listen on (required)")
     parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp",
                         help="Protocol to use: tcp or udp (default: tcp)")
+    parser.add_argument("--cps", type=float, default=0,
+                        help="Expected connections per second (CPS) - used to calculate read timeout. "
+                             "Higher CPS = longer timeout (30s-120s). Default: 30s timeout.")
     parser.add_argument("--processes", type=int, default=None,
                         help="Number of worker processes (default: CPU count)")
     parser.add_argument("--cpu-affinity", action="store_true",
