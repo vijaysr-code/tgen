@@ -631,6 +631,9 @@ def main():
         run_multiprocess_client(args, args.processes, args.cpu_affinity, args.stats_interval)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
+    finally:
+        # Ensure all output is flushed to file
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

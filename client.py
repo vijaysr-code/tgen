@@ -1413,6 +1413,12 @@ def main():
         asyncio.run(run_client(args))
     except KeyboardInterrupt:
         pass
+    finally:
+        # Ensure output is flushed and closed when using --output
+        if args.output:
+            sys.stdout.flush()
+            if hasattr(sys.stdout, 'close'):
+                sys.stdout.close()
 
 
 if __name__ == "__main__":
