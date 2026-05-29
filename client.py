@@ -1202,9 +1202,27 @@ async def run_client(args):
                 if (current_time - last_progress_time) >= progress_interval:
                     active_tasks = len(tasks)
                     timestamp = _format_timestamp()
+                    # Build error breakdown if there are errors
+                    error_detail = ""
+                    if stats.failed > 0:
+                        error_parts = []
+                        if stats.rst_failures > 0:
+                            error_parts.append(f"{stats.rst_failures} RST")
+                        if stats.timeout_failures > 0:
+                            error_parts.append(f"{stats.timeout_failures} timeout")
+                        if stats.refused_failures > 0:
+                            error_parts.append(f"{stats.refused_failures} refused")
+                        if stats.aborted_failures > 0:
+                            error_parts.append(f"{stats.aborted_failures} aborted")
+                        if stats.broken_pipe_failures > 0:
+                            error_parts.append(f"{stats.broken_pipe_failures} broken")
+                        if stats.other_failures > 0:
+                            error_parts.append(f"{stats.other_failures} other")
+                        if error_parts:
+                            error_detail = f" ({', '.join(error_parts)})"
+                    
                     print(f"[{timestamp}] Progress: {conn_id} connections created, "
-                          f"{active_tasks} active, {stats.success} successful, "
-                          f"{stats.failed} failed, elapsed {elapsed:.0f}s")
+                          f"{active_tasks} active, {stats.failed} errors{error_detail}, elapsed {elapsed:.0f}s")
                     last_progress_time = current_time
                 
                 # If no tasks remain, exit the loop
