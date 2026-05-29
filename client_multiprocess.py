@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 # Import existing client functions
-from client import run_client, parse_args as client_parse_args, Stats
+from client import run_client, parse_args as client_parse_args, Stats, _format_timestamp
 
 
 @dataclass
@@ -397,8 +397,9 @@ def print_aggregated_summary(stats_list: List[ProcessStats], num_processes: int)
     max_elapsed = max(s.elapsed for s in stats_list) if stats_list else 0
     aggregate_rate = total_connections / max_elapsed if max_elapsed > 0 else 0
     
+    timestamp = _format_timestamp()
     print("\n" + "=" * 70)
-    print("  MULTI-PROCESS CLIENT SUMMARY")
+    print(f"  MULTI-PROCESS CLIENT SUMMARY [{timestamp}]")
     print("=" * 70)
     print(f"  Worker processes  : {num_processes}")
     print(f"  CPU cores         : {mp.cpu_count()}")
