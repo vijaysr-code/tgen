@@ -815,6 +815,11 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         except Exception:
             pass
 
+        # Log successful close with stats
+        elapsed = time.monotonic() - t0
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [{conn_id:>6}] TCP closed     | sent={packets_sent}pkts/{bytes_sent}B | elapsed={elapsed:.1f}s")
+
         result = ConnectionResult(conn_id=conn_id, success=True,
                                   latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent,
                                   retry_attempts=retry_attempts,
@@ -1221,7 +1226,7 @@ async def run_client(args):
                         if error_parts:
                             error_detail = f" ({', '.join(error_parts)})"
                     
-                    print(f"[{timestamp}] Progress: {conn_id} connections created, "
+                    print(f"[{timestamp}] {conn_id} connections created, "
                           f"{active_tasks} active, {stats.failed} errors{error_detail}, elapsed {elapsed:.0f}s")
                     last_progress_time = current_time
                 
