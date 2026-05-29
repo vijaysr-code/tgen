@@ -827,27 +827,27 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
     except ConnectionResetError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | RST: {e}")
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | RST: {e} | sent={packets_sent}pkts/{bytes_sent}B")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"RST: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, packets_sent=packets_sent, error=f"RST: {e}")
     except ConnectionRefusedError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | refused: {e}")
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | refused: {e} | sent={packets_sent}pkts/{bytes_sent}B")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"refused: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, packets_sent=packets_sent, error=f"refused: {e}")
     except ConnectionAbortedError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | aborted: {e}")
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | aborted: {e} | sent={packets_sent}pkts/{bytes_sent}B")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"aborted: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, packets_sent=packets_sent, error=f"aborted: {e}")
     except BrokenPipeError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | broken_pipe: {e}")
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | broken_pipe: {e} | sent={packets_sent}pkts/{bytes_sent}B")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=f"broken_pipe: {e}")
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, packets_sent=packets_sent, error=f"broken_pipe: {e}")
     except asyncio.TimeoutError as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
@@ -923,16 +923,16 @@ async def tcp_connection(conn_id: int, host: str, port: int, payload: bytes,
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         error_detail = f"error:{e.errno}" if hasattr(e, 'errno') else str(e)
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail}")
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail} | sent={packets_sent}pkts/{bytes_sent}B")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, packets_sent=packets_sent, error=error_detail)
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         timestamp = _format_timestamp()
         error_detail = f"{type(e).__name__}: {e}"
-        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail}")
+        print(f"[{timestamp}] [{conn_id:>6}] TCP FAILED     | target={host}:{port} | {error_detail} | sent={packets_sent}pkts/{bytes_sent}B")
         result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
+                                  latency_ms=latency_ms, bytes_sent=bytes_sent, packets_sent=packets_sent, error=error_detail)
     if result is not None:
         stats.record(result)
         # Update dashboard for failed connections

@@ -342,6 +342,31 @@ class ServerStats:
         return "\n".join(lines)
 
 
+
+def calculate_timeout(cps: float = 0) -> float:
+    """
+    Calculate connection timeout based on connections per second (CPS).
+    Higher CPS = more server load = need longer timeout to avoid premature disconnects.
+    
+    This matches the client-side timeout calculation to ensure compatibility.
+    
+    Args:
+        cps: Connections per second rate (0 = use default)
+    
+    Returns:
+        Timeout in seconds
+    """
+    if cps >= 1000:
+        return 120.0  # Very high rate: 2 minutes
+    elif cps >= 500:
+        return 90.0   # High rate: 1.5 minutes
+    elif cps >= 100:
+        return 60.0   # Medium-high rate: 1 minute
+    elif cps >= 50:
+        return 45.0   # Medium rate: 45 seconds
+    else:
+        return 30.0   # Low rate: 30 seconds (default)
+
 # ─── TCP ─────────────────────────────────────────────────────────────────────
 
 # TCP keepalive constants (always enabled for TCP connections)
@@ -436,7 +461,8 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
 async def _handle_file_transfer(reader: asyncio.StreamReader,
                                  writer: asyncio.StreamWriter,
                                  rec: ConnectionRecord,
-                                 first_chunk: bytes) -> None:
+                                 first_chunk: bytes,
+                                 timeout: float = 30.0) -> None:
     """
     Handle a file-transfer connection.
 
@@ -453,7 +479,10 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
     # Safely buffer until we have exactly _FILE_HEADER_LEN bytes
     buf = first_chunk
     while len(buf) < _FILE_HEADER_LEN:
-        more = await reader.read(_FILE_HEADER_LEN - len(buf))
+        more = await asyncio.wait_for(
+            reader.read(_FILE_HEADER_LEN - len(buf)),
+            timeout=timeout
+        )
         if not more:
             writer.write(b"FAIL:incomplete header\n")
             await writer.drain()
@@ -494,7 +523,10 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
         rec.bytes_received += bytes_read  # count leftover bytes received
 
     while bytes_read < expected_size:
-        chunk = await reader.read(min(65536, expected_size - bytes_read))
+        chunk = await asyncio.wait_for(
+            reader.read(min(65536, expected_size - bytes_read)),
+            timeout=timeout
+        )
         if not chunk:
             break
         sha256_hasher.update(chunk)
@@ -531,7 +563,7 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
         )
 
 
-async def _read_normal_tcp_stream(reader: asyncio.StreamReader, initial_buf: bytes) -> tuple[int, int]:
+async def _read_normal_tcp_stream(reader: asyncio.StreamReader, initial_buf: bytes, timeout: float = 30.0) -> tuple[int, int]:
     """Read a normal TCP stream and return total bytes and message count."""
     total_bytes = 0
     message_count = 0
@@ -541,7 +573,10 @@ async def _read_normal_tcp_stream(reader: asyncio.StreamReader, initial_buf: byt
         message_count += 1
 
     while True:
-        data = await reader.read(65536)
+        data = await asyncio.wait_for(
+            reader.read(65536),
+            timeout=timeout
+        )
         if not data:
             break
         total_bytes += len(data)
@@ -553,7 +588,8 @@ async def _read_normal_tcp_stream(reader: asyncio.StreamReader, initial_buf: byt
 async def handle_tcp_client(reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
                              stats: ServerStats,
-                             dashboard_tracker=None):
+                             dashboard_tracker=None,
+                             timeout: float = 30.0):
     addr = writer.get_extra_info("peername")
     addr_str = f"{addr[0]}:{addr[1]}" if addr else "unknown"
 
@@ -586,16 +622,25 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
         # we still can't be sure it's not a file transfer (due to TCP stream fragmentation).
         buf: bytes = b""
         while len(buf) < prefix_len:
-            chunk = await reader.read(min(65536, prefix_len - len(buf)))
+            # Apply timeout to initial read to prevent indefinite blocking
+            chunk = await asyncio.wait_for(
+                reader.read(min(65536, prefix_len - len(buf))),
+                timeout=timeout
+            )
             if not chunk:
                 break
             buf += chunk
 
         if buf.startswith(_FILE_HEADER_PREFIX):
             # File-transfer mode: pass the buffered header prefix along
-            await _handle_file_transfer(reader, writer, rec, buf)
+            await _handle_file_transfer(reader, writer, rec, buf, timeout)
         elif buf:
-            rec.bytes_received, rec.messages_received = await _read_normal_tcp_stream(reader, buf)
+            rec.bytes_received, rec.messages_received = await _read_normal_tcp_stream(reader, buf, timeout)
+    except asyncio.TimeoutError:
+        # Connection timed out waiting for data
+        disconnect_reason = "timeout"
+        timestamp = _format_timestamp()
+        _log_connection(f"[{timestamp}] [{rec.conn_id:>6}] TCP timeout    | {addr_str} | {timeout}s")
     except asyncio.CancelledError:
         disconnect_reason = "cancelled"
         raise  # Re-raise to allow proper cleanup
@@ -656,10 +701,10 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
                 print(f"[{timestamp}] Warning: Cleanup error for {addr_str}: {type(e).__name__}: {e}")
 
 
-async def run_tcp_server(host: str, port: int, stats: ServerStats, dashboard_tracker=None):
+async def run_tcp_server(host: str, port: int, stats: ServerStats, dashboard_tracker=None, timeout: float = 30.0):
     async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         try:
-            await handle_tcp_client(r, w, stats, dashboard_tracker)
+            await handle_tcp_client(r, w, stats, dashboard_tracker, timeout)
         except Exception as e:
             # Catch any unhandled exceptions to prevent them from propagating
             # to asyncio's internal error handler
@@ -840,6 +885,9 @@ async def run_udp_server(host: str, port: int, stats: ServerStats, dashboard_tra
 async def run_server(args):
     stats = ServerStats()
     
+    # Calculate timeout based on expected CPS
+    timeout = calculate_timeout(args.cps if hasattr(args, 'cps') else 0)
+    
     # Dashboard integration
     dashboard_reporter = None
     dashboard_tracker = None
@@ -866,6 +914,7 @@ async def run_server(args):
     print(f"  Bind     : {args.host}:{args.port}")
     if args.protocol == "tcp":
         print(f"  Keepalive: ON (idle={_KA_IDLE}s, intvl={_KA_INTERVAL}s, cnt={_KA_COUNT})")
+        print(f"  Timeout  : {timeout}s (read timeout per connection)")
     print("-" * 55)
 
     loop = asyncio.get_running_loop()
@@ -897,7 +946,7 @@ async def run_server(args):
 
     try:
         if args.protocol == "tcp":
-            await run_tcp_server(args.host, args.port, stats, dashboard_tracker)
+            await run_tcp_server(args.host, args.port, stats, dashboard_tracker, timeout)
         else:
             await run_udp_server(args.host, args.port, stats, dashboard_tracker)
     except asyncio.CancelledError:
@@ -914,6 +963,7 @@ OPTIONS
   --host HOST           Address to bind on
   --port PORT           Port to listen on (required)
   --protocol {tcp,udp}  Protocol to use
+  --cps CPS             Expected connections per second (for timeout calculation)
   --output PATH         Optional file path to log the output results
   --quiet               Suppress per-connection messages (still written to output file)
   --dashboard URL       Dashboard metrics API URL
@@ -923,6 +973,12 @@ NOTES
 -----
   * TCP keepalive is automatically enabled for all accepted TCP connections
     (idle=10s, interval=10s, count=5).
+  * TCP read timeout is calculated based on expected CPS to prevent indefinite blocking:
+    - CPS >= 1000: 120s timeout (very high load)
+    - CPS >= 500:  90s timeout (high load)
+    - CPS >= 100:  60s timeout (medium-high load)
+    - CPS >= 50:   45s timeout (medium load)
+    - CPS < 50:    30s timeout (default, low load)
   * UDP sessions are tracked per unique (host, port) pair with dynamic timeout:
     - Timeout = 3x packet interval (min: 5s, max: 300s)
     - Client sends interval in each packet for automatic adjustment
@@ -933,8 +989,11 @@ NOTES
 
 EXAMPLES
 --------
-  # TCP server on port 9000
+  # TCP server on port 9000 (default 30s timeout)
   python server.py --port 9000
+
+  # TCP server expecting high load (90s timeout)
+  python server.py --port 9000 --cps 500
 
   # UDP server on port 9001
   python server.py --port 9001 --protocol udp
@@ -962,6 +1021,9 @@ def parse_args():
     parser.add_argument("--port", type=_port_type, required=True, help="Port to listen on")
     parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp",
                         help="Protocol to use")
+    parser.add_argument("--cps", type=float, default=0,
+                        help="Expected connections per second (CPS) - used to calculate read timeout. "
+                             "Higher CPS = longer timeout (30s-120s). Default: 30s timeout.")
     parser.add_argument("--output", type=str, default=None,
                         help="Optional file path to log the output results")
     parser.add_argument("--quiet", action="store_true",
