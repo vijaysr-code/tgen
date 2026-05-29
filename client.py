@@ -199,9 +199,10 @@ class Stats:
         self.finalize()  # Flush any remaining buffered results
         elapsed = time.monotonic() - self.start_time
         rate = self.total / elapsed if elapsed > 0 else 0
+        timestamp = _format_timestamp()
         lines = [
             "\n" + "=" * 55,
-            "  CLIENT SUMMARY",
+            f"  CLIENT SUMMARY [{timestamp}]",
             "=" * 55,
             f"  Elapsed time      : {elapsed:.2f}s",
             f"  Total connections : {self.total}",
@@ -1131,6 +1132,8 @@ async def run_client(args):
 
     # Use absolute deadline-based scheduling to eliminate cumulative drift
     start_time = time.monotonic()
+    last_progress_time = start_time
+    progress_interval = 60.0  # Print progress every 1 minute
     
     # Batch size for task creation: create multiple tasks before yielding to event loop
     # This reduces context switching overhead when CPS is high
@@ -1180,10 +1183,33 @@ async def run_client(args):
         # Use duration + 10s buffer for long-lived connections, or 30s for short-lived
         wait_timeout = (args.duration + 10.0) if args.duration else 30.0
         if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=wait_timeout)
-            if pending:
-                print(f"Warning: {len(pending)} tasks still running after {wait_timeout:.0f}s.",
-                      file=sys.stderr)
+            # Print periodic progress while waiting for connections to complete
+            wait_start = time.monotonic()
+            while tasks:
+                # Wait for tasks with a timeout for progress updates
+                remaining_time = wait_timeout - (time.monotonic() - wait_start)
+                if remaining_time <= 0:
+                    print(f"Warning: {len(tasks)} tasks still running after {wait_timeout:.0f}s.",
+                          file=sys.stderr)
+                    break
+                
+                wait_duration = min(progress_interval, remaining_time)
+                done, pending = await asyncio.wait(tasks, timeout=wait_duration)
+                
+                # Print progress update if interval has passed
+                current_time = time.monotonic()
+                elapsed = current_time - start_time
+                if (current_time - last_progress_time) >= progress_interval:
+                    active_tasks = len(tasks)
+                    timestamp = _format_timestamp()
+                    print(f"[{timestamp}] Progress: {conn_id} connections created, "
+                          f"{active_tasks} active, {stats.success} successful, "
+                          f"{stats.failed} failed, elapsed {elapsed:.0f}s")
+                    last_progress_time = current_time
+                
+                # If no tasks remain, exit the loop
+                if not tasks:
+                    break
 
     except asyncio.CancelledError:
         pass
