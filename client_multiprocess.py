@@ -36,10 +36,20 @@ class ProcessStats:
 
 
 def worker_process(process_id: int, args, connections_per_process: int,
-                   result_queue: mp.Queue, num_processes: int = 1, use_affinity: bool = False):
+                   result_queue: mp.Queue, num_processes: int = 1, use_affinity: bool = False,
+                   original_cps: Optional[float] = None):
     """
     Worker process that runs its own event loop
     Each process handles a portion of the total connections
+    
+    Args:
+        process_id: Unique ID for this worker process
+        args: Command-line arguments
+        connections_per_process: Number of connections this worker should handle
+        result_queue: Queue for returning statistics
+        num_processes: Total number of worker processes
+        use_affinity: Whether to pin this process to a specific CPU core
+        original_cps: Original total CPS before division (for timeout calculation)
     """
     # Set CPU affinity if requested (Linux only)
     if use_affinity and hasattr(os, 'sched_setaffinity'):
@@ -58,6 +68,11 @@ def worker_process(process_id: int, args, connections_per_process: int,
     # If we don't do this, each worker will try to connect at the full CPS rate,
     # resulting in total_rate = CPS * num_processes, which causes timeouts and 0-byte connections
     worker_args.cps = args.cps / num_processes
+    
+    # Store original CPS for timeout calculation
+    # Timeout should be based on TOTAL server load, not per-worker rate
+    if original_cps is not None:
+        worker_args.original_cps = original_cps
     
     # Suppress individual worker summary output
     # We'll aggregate all stats in the main process
@@ -240,7 +255,7 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
         
         p = mp.Process(
             target=worker_process,
-            args=(i, args, worker_connections, result_queue, num_processes, use_affinity)
+            args=(i, args, worker_connections, result_queue, num_processes, use_affinity, args.cps)
         )
         p.start()
         processes.append(p)
