@@ -1075,8 +1075,11 @@ async def run_client(args):
     conn_id = 0
     tasks = set()
     
-    # Calculate timeout based on CPS to handle high connection rates
-    connection_timeout = calculate_timeout(args.cps)
+    # Calculate timeout based on TOTAL CPS (not per-worker CPS in multiprocess mode)
+    # Use original_cps if provided by multiprocess client, otherwise use args.cps
+    # This ensures timeout scales with actual server load, not per-worker rate
+    timeout_cps = getattr(args, 'original_cps', args.cps)
+    connection_timeout = calculate_timeout(timeout_cps)
     
     # Dashboard integration
     dashboard_reporter = None
@@ -1205,6 +1208,8 @@ async def run_client(args):
                 current_time = time.monotonic()
                 elapsed = current_time - start_time
                 if (current_time - last_progress_time) >= progress_interval:
+                    # Flush batch buffer to get current error counts
+                    stats.finalize()
                     active_tasks = len(tasks)
                     timestamp = _format_timestamp()
                     # Build error breakdown if there are errors
