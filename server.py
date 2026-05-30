@@ -428,6 +428,7 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         TCP_INFO = 11
 
         # Get TCP_INFO structure (size varies by kernel version, but we only need first ~200 bytes)
+        # This can raise OSError (errno 5 = EIO) if socket is already closed or in bad state
         tcp_info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
 
         # Parse relevant fields from tcp_info structure
@@ -454,6 +455,10 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         rtt_var_ms = rtt_var_us / 1000.0 if rtt_var_us > 0 else None
 
         return (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost, reordering)
+    except OSError as e:
+        # Socket errors (e.g., errno 5 = EIO when socket already closed)
+        # This is expected when client disconnects abruptly
+        return (None, None, None, None, None, None)
     except Exception:
         # TCP_INFO not available or parsing failed
         return (None, None, None, None, None, None)
@@ -653,9 +658,16 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
                 disconnect_reason = f"exception:{type(e).__name__}"
     finally:
         # Collect TCP statistics before closing
+        # Wrap in try/except to handle socket errors (e.g., socket already closed)
         if sock is not None:
-            (rec.tcp_retransmits, rec.tcp_rtt_ms, rec.tcp_rtt_var_ms,
-             rec.tcp_snd_cwnd, rec.tcp_lost_packets, rec.tcp_reordering) = get_tcp_info(sock)
+            try:
+                (rec.tcp_retransmits, rec.tcp_rtt_ms, rec.tcp_rtt_var_ms,
+                 rec.tcp_snd_cwnd, rec.tcp_lost_packets, rec.tcp_reordering) = get_tcp_info(sock)
+            except (OSError, Exception):
+                # Socket may already be closed or in bad state
+                # Set all TCP stats to None
+                (rec.tcp_retransmits, rec.tcp_rtt_ms, rec.tcp_rtt_var_ms,
+                 rec.tcp_snd_cwnd, rec.tcp_lost_packets, rec.tcp_reordering) = (None, None, None, None, None, None)
         
         # Update dashboard
         if dashboard_tracker:
