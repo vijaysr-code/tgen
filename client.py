@@ -1233,6 +1233,7 @@ async def run_client(args):
                     
                     print(f"[{timestamp}] {conn_id} connections created, "
                           f"{active_tasks} active, {stats.failed} errors{error_detail}, elapsed {elapsed:.0f}s")
+                    sys.stdout.flush()  # Ensure progress message is written immediately
                     last_progress_time = current_time
                 
                 # If no tasks remain, exit the loop
