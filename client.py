@@ -1264,6 +1264,9 @@ async def run_client(args):
                 await dashboard_task
             except asyncio.CancelledError:
                 pass
+        
+        # Return stats object for programmatic access (e.g., multiprocess workers)
+        return stats
 
 
 def parse_args():
