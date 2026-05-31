@@ -172,6 +172,17 @@ class ConnectionRecord:
         return base_row
 
 
+# Disconnect reason labels for TCP statistics formatting
+_DISCONNECT_LABELS = [
+    ("normal", "normal"),
+    ("RST", "RST"),
+    ("aborted", "aborted"),
+    ("broken", "broken_pipe"),
+    ("incomplete", "incomplete"),
+    ("other", "other"),
+]
+
+
 @dataclass
 class SummaryStats:
     """Aggregated statistics from a single pass over records."""
@@ -431,18 +442,39 @@ class ServerStats:
         if not tcp_records:
             return []
         
-        # Aggregate TCP metrics using comprehensions
-        total_retx = sum(r.tcp_retransmits or 0 for r in tcp_records)
-        total_lost = sum(r.tcp_lost_packets or 0 for r in tcp_records)
-        tcp_retx_conns = sum(1 for r in tcp_records if (r.tcp_retransmits or 0) > 0)
-        tcp_loss_conns = sum(1 for r in tcp_records if (r.tcp_lost_packets or 0) > 0)
-        rtt_vals = [r.tcp_rtt_ms for r in tcp_records if r.tcp_rtt_ms is not None]
-        rtt_var_vals = [r.tcp_rtt_var_ms for r in tcp_records if r.tcp_rtt_var_ms is not None]
+        # Single-pass aggregation of TCP metrics
+        total_retx = 0
+        total_lost = 0
+        tcp_retx_conns = 0
+        tcp_loss_conns = 0
+        rtt_vals = []
+        rtt_var_vals = []
+        
+        for r in tcp_records:
+            retx = r.tcp_retransmits or 0
+            lost = r.tcp_lost_packets or 0
+            
+            total_retx += retx
+            total_lost += lost
+            
+            if retx > 0:
+                tcp_retx_conns += 1
+            if lost > 0:
+                tcp_loss_conns += 1
+            
+            if r.tcp_rtt_ms is not None:
+                rtt_vals.append(r.tcp_rtt_ms)
+            if r.tcp_rtt_var_ms is not None:
+                rtt_var_vals.append(r.tcp_rtt_var_ms)
         
         # Calculate averages for all TCP connections
         tcp_all_count = len(tcp_all_records)
-        tcp_avg_bytes = sum(r.bytes_received for r in tcp_all_records) / tcp_all_count if tcp_all_count else 0.0
-        tcp_avg_msgs = sum(r.messages_received for r in tcp_all_records) / tcp_all_count if tcp_all_count else 0.0
+        if tcp_all_count > 0:
+            tcp_avg_bytes = sum(r.bytes_received for r in tcp_all_records) / tcp_all_count
+            tcp_avg_msgs = sum(r.messages_received for r in tcp_all_records) / tcp_all_count
+        else:
+            tcp_avg_bytes = 0.0
+            tcp_avg_msgs = 0.0
         
         # Disconnect reasons
         disconnect_counts = self._count_disconnect_reasons(tcp_all_records)
@@ -462,17 +494,9 @@ class ServerStats:
         lines.extend(self._format_rtt_stats("RTT var", rtt_var_vals))
         
         # Format disconnect reasons with consistent alignment
-        disconnect_labels = [
-            ("normal", "normal"),
-            ("RST", "RST"),
-            ("aborted", "aborted"),
-            ("broken", "broken_pipe"),
-            ("incomplete", "incomplete"),
-            ("other", "other"),
-        ]
         lines.extend([
             f"    Disconnect {label:<10}: {disconnect_counts[key]}"
-            for label, key in disconnect_labels
+            for label, key in _DISCONNECT_LABELS
         ])
         
         return lines
