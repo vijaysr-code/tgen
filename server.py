@@ -13,6 +13,7 @@ import platform
 import resource
 import signal
 import socket
+import struct
 import sys
 import textwrap
 import time
@@ -34,6 +35,9 @@ except ImportError:
 
 # Timestamp cache for performance optimization
 _TIMESTAMP_CACHE = {}
+
+# TCP_INFO socket option constant (Linux-specific)
+_TCP_INFO_SOCKOPT = 11
 
 def _format_timestamp() -> str:
     """Optimized timestamp formatting with caching. Returns ISO-8601 format with milliseconds."""
@@ -418,22 +422,16 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
     Retrieve TCP socket statistics (Linux only).
     Returns: (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost_packets, reordering)
     """
-    system = platform.system()
-    if system != "Linux":
+    if platform.system() != "Linux":
         return (None, None, None, None, None, None)
 
     try:
-        # TCP_INFO socket option (Linux-specific)
-        # struct tcp_info is defined in <linux/tcp.h>
-        TCP_INFO = 11
-
         # Get TCP_INFO structure (size varies by kernel version, but we only need first ~200 bytes)
         # This can raise OSError (errno 5 = EIO) if socket is already closed or in bad state
-        tcp_info = sock.getsockopt(socket.IPPROTO_TCP, TCP_INFO, 256)
+        tcp_info = sock.getsockopt(socket.IPPROTO_TCP, _TCP_INFO_SOCKOPT, 256)
 
         # Parse relevant fields from tcp_info structure
         # Offsets based on Linux kernel struct tcp_info (kernel 4.x+, x86_64)
-        import struct
 
         # Stable offsets for commonly used struct tcp_info fields:
         # tcpi_retransmits (u8) at offset 2
@@ -455,12 +453,9 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         rtt_var_ms = rtt_var_us / 1000.0 if rtt_var_us > 0 else None
 
         return (retransmits, rtt_ms, rtt_var_ms, snd_cwnd, lost, reordering)
-    except OSError as e:
+    except (OSError, struct.error):
         # Socket errors (e.g., errno 5 = EIO when socket already closed)
-        # This is expected when client disconnects abruptly
-        return (None, None, None, None, None, None)
-    except Exception:
-        # TCP_INFO not available or parsing failed
+        # or struct parsing failures - both expected when client disconnects abruptly
         return (None, None, None, None, None, None)
 
 async def _handle_file_transfer(reader: asyncio.StreamReader,
@@ -745,6 +740,11 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
     UDP is connectionless; we track 'connections' per unique (host, port) pair.
     A connection is considered closed after `timeout` seconds of inactivity.
     """
+    
+    # Dynamic timeout calculation constants
+    UDP_TIMEOUT_MULTIPLIER = 3.0  # Multiply packet interval by this factor
+    UDP_TIMEOUT_MIN = 5.0         # Minimum timeout in seconds
+    UDP_TIMEOUT_MAX = 300.0       # Maximum timeout in seconds
 
     def __init__(self, stats: ServerStats, timeout: float = 5.0, dashboard_tracker=None):
         self.stats = stats
@@ -769,9 +769,66 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             except OSError:
                 pass  # Ignore if system doesn't allow buffer size changes
 
-    def datagram_received(self, data: bytes, addr: tuple):
+    def _parse_udp_packet(self, data: bytes, rec: ConnectionRecord) -> float:
+        """
+        Parse UDP packet to extract sequence number and calculate dynamic timeout.
+        
+        Args:
+            data: The raw packet data
+            rec: The connection record to update
+            
+        Returns:
+            float: The calculated timeout value for this packet
+        """
+        # Default to standard timeout
+        dynamic_timeout = self.timeout
+        rec.messages_received += 1
+        
+        # Extract sequence number and interval from payload (first 8 bytes: seq_num + interval_ms)
+        if len(data) >= 8:
+            try:
+                seq_num, interval_ms = struct.unpack('!II', data[:8])
+                
+                # Track the highest sequence number seen
+                if seq_num > rec.udp_highest_seq:
+                    rec.udp_highest_seq = seq_num
+                
+                # Calculate dynamic timeout based on packet interval
+                # Use multiplier * interval as timeout, with min and max bounds
+                if interval_ms > 0:
+                    dynamic_timeout = max(
+                        self.UDP_TIMEOUT_MIN,
+                        min(self.UDP_TIMEOUT_MAX, (interval_ms / 1000.0) * self.UDP_TIMEOUT_MULTIPLIER)
+                    )
+                # else: interval_ms == 0 means single packet or no periodic traffic, use default
+            except Exception:
+                # If extraction fails, use defaults (already set above)
+                pass
+        
+        return dynamic_timeout
+    
+    def _reset_session_timer(self, addr: tuple, timeout: float) -> None:
+        """
+        Reset the inactivity timer for a UDP session.
+        
+        Args:
+            addr: The client address tuple (host, port)
+            timeout: The timeout value in seconds
+        """
+        # Cancel existing timer if present
+        if addr in self._timers:
+            self._timers[addr].cancel()
+        
+        # Schedule new timer
+        loop = self._loop
+        if loop is not None:
+            self._timers[addr] = loop.call_later(timeout, self._expire_session, addr)
+
+    def datagram_received(self, data: bytes, addr: tuple) -> None:
+        """Handle incoming UDP datagram."""
         addr_str = f"{addr[0]}:{addr[1]}"
 
+        # Get or create session record
         if addr not in self._sessions:
             # New "connection" — use sync helper (event loop is single-threaded here)
             rec = self.stats.new_connection_sync(addr_str)
@@ -782,47 +839,17 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             # Update dashboard
             if self.dashboard_tracker:
                 self.dashboard_tracker.record_connection()
-
-        rec = self._sessions[addr]
+        else:
+            rec = self._sessions[addr]
+        
+        # Update basic stats
         rec.bytes_received += len(data)
         
-        # Extract sequence number and interval from payload (first 8 bytes: seq_num + interval_ms)
-        if len(data) >= 8:
-            try:
-                import struct
-                seq_num, interval_ms = struct.unpack('!II', data[:8])
-                
-                # Track the highest sequence number seen
-                if seq_num > rec.udp_highest_seq:
-                    rec.udp_highest_seq = seq_num
-                
-                # Calculate dynamic timeout based on packet interval
-                # Use 3x the interval as timeout, with min 5s and max 300s
-                if interval_ms > 0:
-                    dynamic_timeout = max(5.0, min(300.0, (interval_ms / 1000.0) * 3.0))
-                else:
-                    # interval_ms == 0 means single packet or no periodic traffic
-                    # Use default timeout
-                    dynamic_timeout = self.timeout
-                
-                rec.messages_received += 1
-            except Exception:
-                # If extraction fails, just count the packet
-                rec.messages_received += 1
-                dynamic_timeout = self.timeout
-        else:
-            # Packet too small, just count it
-            rec.messages_received += 1
-            dynamic_timeout = self.timeout
-
-        # Reset inactivity timer with dynamic timeout
-        if addr in self._timers:
-            self._timers[addr].cancel()
-        loop = self._loop
-        if loop is not None:
-            self._timers[addr] = loop.call_later(
-                dynamic_timeout, self._expire_session, addr
-            )
+        # Parse packet and calculate dynamic timeout
+        dynamic_timeout = self._parse_udp_packet(data, rec)
+        
+        # Reset inactivity timer
+        self._reset_session_timer(addr, dynamic_timeout)
 
     def _expire_session(self, addr: tuple):
         rec = self._sessions.pop(addr, None)
