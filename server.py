@@ -644,6 +644,74 @@ def get_tcp_info(sock: socket.socket) -> Tuple[Optional[int], Optional[float], O
         # Socket errors (e.g., errno 5 = EIO when socket already closed)
         # or struct parsing failures - both expected when client disconnects abruptly
         return (None, None, None, None, None, None)
+async def _send_response(writer: asyncio.StreamWriter, message: bytes) -> None:
+    """Send response message and ensure it's flushed."""
+    writer.write(message)
+    await writer.drain()
+
+
+async def _parse_file_header(
+    reader: asyncio.StreamReader,
+    first_chunk: bytes,
+    timeout: float
+) -> Tuple[str, int, bytes]:
+    """
+    Parse file transfer header and return (expected_sha256, expected_size, leftover_bytes).
+    Raises ValueError with user-friendly message on parse failure.
+    """
+    # Use readexactly for cleaner buffering
+    needed = _FILE_HEADER_LEN - len(first_chunk)
+    if needed > 0:
+        try:
+            more = await asyncio.wait_for(
+                reader.readexactly(needed),
+                timeout=timeout
+            )
+            header = first_chunk + more
+        except asyncio.IncompleteReadError:
+            raise ValueError("incomplete header")
+    else:
+        header = first_chunk[:_FILE_HEADER_LEN]
+    
+    leftover = first_chunk[_FILE_HEADER_LEN:] if len(first_chunk) > _FILE_HEADER_LEN else b""
+    
+    # Parse: TGEN_FILE:<sha256>:<size>\n
+    try:
+        inner = header[len(_FILE_HEADER_PREFIX):].rstrip(b"\n")
+        sha256_expected, size_str = inner.split(b":", 1)
+        return sha256_expected.decode(), int(size_str.decode()), leftover
+    except Exception:
+        raise ValueError("malformed header")
+
+
+async def _receive_and_hash_file(
+    reader: asyncio.StreamReader,
+    expected_size: int,
+    leftover: bytes,
+    timeout: float,
+    chunk_size: int = 65536
+) -> Tuple[int, str]:
+    """
+    Stream file data, compute SHA256, return (bytes_read, sha256_hex).
+    """
+    sha256_hasher = hashlib.sha256()
+    bytes_read = 0
+    
+    if leftover:
+        sha256_hasher.update(leftover)
+        bytes_read = len(leftover)
+    
+    while bytes_read < expected_size:
+        to_read = min(chunk_size, expected_size - bytes_read)
+        chunk = await asyncio.wait_for(reader.read(to_read), timeout=timeout)
+        if not chunk:
+            break
+        sha256_hasher.update(chunk)
+        bytes_read += len(chunk)
+    
+    return bytes_read, sha256_hasher.hexdigest()
+
+
 
 async def _handle_file_transfer(reader: asyncio.StreamReader,
                                  writer: asyncio.StreamWriter,
@@ -663,88 +731,58 @@ async def _handle_file_transfer(reader: asyncio.StreamReader,
     """
     rec.file_transfer = True
 
-    # Safely buffer until we have exactly _FILE_HEADER_LEN bytes
-    buf = first_chunk
-    while len(buf) < _FILE_HEADER_LEN:
-        more = await asyncio.wait_for(
-            reader.read(_FILE_HEADER_LEN - len(buf)),
-            timeout=timeout
-        )
-        if not more:
-            writer.write(b"FAIL:incomplete header\n")
-            await writer.drain()
-            rec.checksum_ok = False
-            return
-        buf += more
-
-    header = buf[:_FILE_HEADER_LEN]
-    leftover = buf[_FILE_HEADER_LEN:]
-
-    # Parse header: TGEN_FILE:<sha256>:<size>\n
+    # Parse header
     try:
-        inner = header[len(_FILE_HEADER_PREFIX):].rstrip(b"\n")
-        sha256_expected, size_str = inner.split(b":", 1)
-        expected_sha256 = sha256_expected.decode()
-        expected_size = int(size_str.decode())
-    except Exception:
-        writer.write(b"FAIL:malformed header\n")
-        await writer.drain()
+        expected_sha256, expected_size, leftover = await _parse_file_header(
+            reader, first_chunk, timeout
+        )
+    except ValueError as e:
+        await _send_response(writer, f"FAIL:{e}\n".encode())
         rec.checksum_ok = False
         return
 
     # Enforce server-side file size limit to prevent memory exhaustion
     if expected_size > _SERVER_MAX_FILE_SIZE:
-        writer.write(b"FAIL:file too large\n")
-        await writer.drain()
+        await _send_response(writer, b"FAIL:file too large\n")
         rec.checksum_ok = False
-        print(f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | FAIL file too large ({expected_size}B)")
+        _log_connection(
+            f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | "
+            f"FAIL file too large ({expected_size}B)"
+        )
         return
 
-    # Read and hash chunk-by-chunk to avoid loading the whole file into memory
-    sha256_hasher = hashlib.sha256()
-    bytes_read = 0
-
-    if leftover:
-        sha256_hasher.update(leftover)
-        bytes_read = len(leftover)
-        rec.bytes_received += bytes_read  # count leftover bytes received
-
-    while bytes_read < expected_size:
-        chunk = await asyncio.wait_for(
-            reader.read(min(65536, expected_size - bytes_read)),
-            timeout=timeout
-        )
-        if not chunk:
-            break
-        sha256_hasher.update(chunk)
-        bytes_read += len(chunk)
-        rec.bytes_received += len(chunk)
-
+    # Receive and hash file
+    bytes_read, actual_sha256 = await _receive_and_hash_file(
+        reader, expected_size, leftover, timeout
+    )
+    
+    # Update connection record
+    rec.bytes_received += bytes_read
     rec.messages_received = 1
 
+    # Validate size
     if bytes_read != expected_size:
         reason = f"size mismatch: got {bytes_read} expected {expected_size}"
-        writer.write(f"FAIL:{reason}\n".encode())
-        await writer.drain()
+        await _send_response(writer, f"FAIL:{reason}\n".encode())
         rec.checksum_ok = False
-        print(f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | FAIL {reason}")
+        _log_connection(
+            f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | FAIL {reason}"
+        )
         return
 
-    actual_sha256 = sha256_hasher.hexdigest()
-    if actual_sha256 == expected_sha256:
-        writer.write(b"OK\n")
-        await writer.drain()
-        rec.checksum_ok = True
-        print(
+    # Validate checksum
+    rec.checksum_ok = (actual_sha256 == expected_sha256)
+    
+    if rec.checksum_ok:
+        await _send_response(writer, b"OK\n")
+        _log_connection(
             f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | "
             f"{bytes_read}B | checksum=PASS"
         )
     else:
         reason = f"sha256 got={actual_sha256[:16]}... expected={expected_sha256[:16]}..."
-        writer.write(f"FAIL:{reason}\n".encode())
-        await writer.drain()
-        rec.checksum_ok = False
-        print(
+        await _send_response(writer, f"FAIL:{reason}\n".encode())
+        _log_connection(
             f"[{rec.conn_id:>6}] TCP file recv  | {rec.client_addr} | "
             f"{bytes_read}B | checksum=FAIL"
         )
