@@ -172,6 +172,43 @@ class ConnectionRecord:
         return base_row
 
 
+# Disconnect reason labels for TCP statistics formatting
+_DISCONNECT_LABELS = [
+    ("normal", "normal"),
+    ("RST", "RST"),
+    ("aborted", "aborted"),
+    ("broken", "broken_pipe"),
+    ("incomplete", "incomplete"),
+    ("other", "other"),
+]
+
+
+@dataclass
+class SummaryStats:
+    """Aggregated statistics from a single pass over records."""
+    total_records: int = 0
+    completed_records: List[ConnectionRecord] = field(default_factory=list)
+    total_packets: int = 0
+    total_bytes: int = 0
+    
+    # File transfer stats
+    ft_records: List[ConnectionRecord] = field(default_factory=list)
+    ft_pass: int = 0
+    ft_fail: int = 0
+    
+    # TCP stats
+    tcp_records: List[ConnectionRecord] = field(default_factory=list)
+    tcp_all_records: List[ConnectionRecord] = field(default_factory=list)
+    has_tcp_stats: bool = False
+    
+    # UDP stats
+    udp_records: List[ConnectionRecord] = field(default_factory=list)
+    has_udp_stats: bool = False
+    
+    # Flags
+    has_ft: bool = False
+
+
 class ServerStats:
     def __init__(self):
         self.records: List[ConnectionRecord] = []
@@ -209,141 +246,291 @@ class ServerStats:
         return rec
 
     def summary(self) -> str:
+        """Generate comprehensive server statistics summary."""
         elapsed = time.monotonic() - self.start_time
-        completed = [r for r in self.records if r.duration is not None]
-        total = len(self.records)
-        rate = total / elapsed if elapsed > 0 else 0
-        total_pkts = sum(r.messages_received for r in self.records)
-        total_bytes = sum(r.bytes_received for r in self.records)
-
+        
+        # Single-pass data collection
+        stats = self._collect_summary_stats()
+        
+        # Calculate derived metrics
+        rate = stats.total_records / elapsed if elapsed > 0 else 0
+        
+        # Build summary sections
+        lines = self._format_header_section(
+            elapsed, stats.total_records, len(stats.completed_records),
+            rate, stats.total_bytes, stats.total_packets,
+            len(stats.ft_records), stats.ft_pass, stats.ft_fail
+        )
+        
+        # Duration and PPS statistics
+        lines.extend(self._format_duration_pps_stats(stats.completed_records))
+        
+        # Connection details table
+        if self.records:
+            lines.extend(self._format_connection_table(
+                stats.has_ft, stats.has_tcp_stats, stats.has_udp_stats
+            ))
+            
+            # Protocol-specific statistics
+            lines.extend(self._format_tcp_statistics(stats.tcp_records, stats.tcp_all_records))
+            lines.extend(self._format_udp_statistics(stats.udp_records))
+        
+        # Footer
+        lines.extend([
+            "",
+            f"  Final total bytes received: {stats.total_bytes}",
+            "=" * 92
+        ])
+        
+        return "\n".join(lines)
+    
+    def _collect_summary_stats(self) -> SummaryStats:
+        """Collect all statistics in a single pass over records."""
+        stats = SummaryStats()
+        
+        for r in self.records:
+            stats.total_records += 1
+            stats.total_packets += r.messages_received
+            stats.total_bytes += r.bytes_received
+            
+            if r.duration is not None:
+                stats.completed_records.append(r)
+            
+            if r.file_transfer:
+                stats.has_ft = True
+                stats.ft_records.append(r)
+                if r.checksum_ok is True:
+                    stats.ft_pass += 1
+                elif r.checksum_ok is False:
+                    stats.ft_fail += 1
+            
+            if r.tcp_retransmits is not None:
+                stats.has_tcp_stats = True
+                stats.tcp_records.append(r)
+            
+            if ":" in r.client_addr:  # TCP connection (IPv4 or IPv6 with colons)
+                stats.tcp_all_records.append(r)
+            
+            if r.udp_expected_packets > 0:
+                stats.has_udp_stats = True
+                stats.udp_records.append(r)
+        
+        return stats
+    
+    def _format_header_section(
+        self,
+        elapsed: float,
+        total: int,
+        completed_count: int,
+        rate: float,
+        total_bytes: int,
+        total_pkts: int,
+        ft_count: int = 0,
+        ft_pass: int = 0,
+        ft_fail: int = 0
+    ) -> List[str]:
+        """Generate the header section of the summary."""
         lines = [
             "\n" + "=" * 92,
             "  SERVER SUMMARY",
             "=" * 92,
             f"  Elapsed time        : {elapsed:.2f}s",
             f"  Total connections   : {total}",
-            f"  Completed           : {len(completed)}",
-            f"  Still open          : {total - len(completed)}",
+            f"  Completed           : {completed_count}",
+            f"  Still open          : {total - completed_count}",
             f"  Observed rate       : {rate:.2f} conn/s",
             f"  Total bytes received: {total_bytes}",
             f"  Total packets recv  : {total_pkts}",
         ]
-
-        # File-transfer checksum summary
-        ft_records = [r for r in self.records if r.file_transfer]
-        if ft_records:
-            ft_pass = sum(1 for r in ft_records if r.checksum_ok is True)
-            ft_fail = sum(1 for r in ft_records if r.checksum_ok is False)
-            lines += [
-                f"  File transfers      : {len(ft_records)} "
-                f"(checksum PASS={ft_pass} FAIL={ft_fail})",
-            ]
-
-        if completed:
-            # Filter out any None durations defensively (race at shutdown)
-            durations: List[float] = [r.duration for r in completed if r.duration is not None]  # type: ignore[misc]
-            if durations:
-                avg_dur = sum(durations) / len(durations)
-                # Exclude file-transfer connections from PPS stats (1 msg / ~0s = nonsensical)
-                pps_vals: List[float] = []
-                for _r in completed:
-                    if _r.file_transfer:
-                        continue
-                    _p = _r.pps_observed
-                    if _p is not None:
-                        pps_vals.append(_p)
-                lines += [
-                    f"  Duration avg        : {avg_dur:.3f}s",
-                    f"  Duration min        : {min(durations):.3f}s",
-                    f"  Duration max        : {max(durations):.3f}s",
-                ]
-                if pps_vals:
-                    lines += [
-                        f"  PPS avg (recv)      : {sum(pps_vals)/len(pps_vals):.1f} pkt/s",
-                        f"  PPS min (recv)      : {min(pps_vals):.1f} pkt/s",
-                        f"  PPS max (recv)      : {max(pps_vals):.1f} pkt/s",
-                    ]
-
-        if self.records:
-            has_ft = any(r.file_transfer for r in self.records)
-            has_tcp_stats = any(r.tcp_retransmits is not None for r in self.records)
-            # Only show UDP stats if we have UDP connections with expected packet counts
-            has_udp_stats = any(r.udp_expected_packets > 0 for r in self.records)
-            checksum_hdr = " | Checksum" if has_ft else ""
-            tcp_hdr = " | TCP Stats (retx/rtt/lost)" if has_tcp_stats else ""
-            udp_hdr = " | UDP Stats (exp/rcv/lost/%)" if has_udp_stats else ""
+        
+        if ft_count > 0:
+            lines.append(
+                f"  File transfers      : {ft_count} "
+                f"(checksum PASS={ft_pass} FAIL={ft_fail})"
+            )
+        
+        return lines
+    
+    def _format_duration_pps_stats(self, completed: List[ConnectionRecord]) -> List[str]:
+        """Generate duration and PPS statistics for completed connections."""
+        if not completed:
+            return []
+        
+        # Filter out any None durations defensively (race at shutdown)
+        durations = [r.duration for r in completed if r.duration is not None]
+        if not durations:
+            return []
+        
+        lines = [
+            f"  Duration avg        : {sum(durations)/len(durations):.3f}s",
+            f"  Duration min        : {min(durations):.3f}s",
+            f"  Duration max        : {max(durations):.3f}s",
+        ]
+        
+        # Exclude file-transfer connections from PPS stats (1 msg / ~0s = nonsensical)
+        pps_vals = [
+            r.pps_observed
+            for r in completed
+            if not r.file_transfer and r.pps_observed is not None
+        ]
+        
+        if pps_vals:
+            lines.extend([
+                f"  PPS avg (recv)      : {sum(pps_vals)/len(pps_vals):.1f} pkt/s",
+                f"  PPS min (recv)      : {min(pps_vals):.1f} pkt/s",
+                f"  PPS max (recv)      : {max(pps_vals):.1f} pkt/s",
+            ])
+        
+        return lines
+    
+    def _format_connection_table(
+        self,
+        has_ft: bool,
+        has_tcp_stats: bool,
+        has_udp_stats: bool
+    ) -> List[str]:
+        """Generate the connection details table."""
+        checksum_hdr = " | Checksum" if has_ft else ""
+        tcp_hdr = " | TCP Stats (retx/rtt/lost)" if has_tcp_stats else ""
+        udp_hdr = " | UDP Stats (exp/rcv/lost/%)" if has_udp_stats else ""
+        
+        lines = [
+            "",
+            f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages | PPS (recv){checksum_hdr}{tcp_hdr}{udp_hdr}",
+            "  " + "-" * (80 + (10 if has_ft else 0) + (35 if has_tcp_stats else 0) + (35 if has_udp_stats else 0)),
+        ]
+        
+        for rec in self.records:
+            lines.append(rec.row(show_tcp_stats=has_tcp_stats, show_udp_stats=has_udp_stats))
+        
+        return lines
+    
+    def _format_rtt_stats(self, label: str, values: List[float]) -> List[str]:
+        """Format RTT statistics (avg/min/max) for a given metric.
+        
+        Args:
+            label: Metric label (e.g., "RTT", "RTT var")
+            values: List of metric values
             
-            lines += [
-                "",
-                f"  {'ID':>6} | {'Client':<22} | {'Duration':>10} | {'Bytes':>9} | Messages | PPS (recv){checksum_hdr}{tcp_hdr}{udp_hdr}",
-                "  " + "-" * (80 + (10 if has_ft else 0) + (35 if has_tcp_stats else 0) + (35 if has_udp_stats else 0)),
-            ]
-            for rec in self.records:
-                lines.append(rec.row(show_tcp_stats=has_tcp_stats, show_udp_stats=has_udp_stats))
+        Returns:
+            List of formatted statistics lines, empty if no values
+        """
+        if not values:
+            return []
+        
+        avg = sum(values) / len(values)
+        return [
+            f"    {label} avg       : {avg:.2f}ms",
+            f"    {label} min       : {min(values):.2f}ms",
+            f"    {label} max       : {max(values):.2f}ms",
+        ]
+    
+    def _format_tcp_statistics(
+        self,
+        tcp_records: List[ConnectionRecord],
+        tcp_all_records: List[ConnectionRecord]
+    ) -> List[str]:
+        """Generate TCP statistics summary section.
+        
+        Args:
+            tcp_records: Records with TCP statistics (completed connections)
+            tcp_all_records: All TCP records (including incomplete)
             
-            # Add TCP statistics summary if available
-            if has_tcp_stats:
-                tcp_records = [r for r in self.records if r.tcp_retransmits is not None]
-                total_retx = sum(r.tcp_retransmits for r in tcp_records if r.tcp_retransmits is not None)
-                total_lost = sum(r.tcp_lost_packets for r in tcp_records if r.tcp_lost_packets is not None)
-                rtt_vals = [r.tcp_rtt_ms for r in tcp_records if r.tcp_rtt_ms is not None]
-                rtt_var_vals = [r.tcp_rtt_var_ms for r in tcp_records if r.tcp_rtt_var_ms is not None]
-                tcp_all_records = [r for r in self.records if ":" in r.client_addr]
-                tcp_retx_conns = sum(1 for r in tcp_records if (r.tcp_retransmits or 0) > 0)
-                tcp_loss_conns = sum(1 for r in tcp_records if (r.tcp_lost_packets or 0) > 0)
-                tcp_avg_bytes = (sum(r.bytes_received for r in tcp_all_records) / len(tcp_all_records)) if tcp_all_records else 0.0
-                tcp_avg_msgs = (sum(r.messages_received for r in tcp_all_records) / len(tcp_all_records)) if tcp_all_records else 0.0
-                disconnect_normal = sum(1 for r in tcp_all_records if r.disconnect_reason == "normal")
-                disconnect_rst = sum(1 for r in tcp_all_records if r.disconnect_reason == "RST")
-                disconnect_aborted = sum(1 for r in tcp_all_records if r.disconnect_reason == "aborted")
-                disconnect_broken = sum(1 for r in tcp_all_records if r.disconnect_reason == "broken_pipe")
-                disconnect_incomplete = sum(1 for r in tcp_all_records if r.disconnect_reason == "incomplete")
-                disconnect_other = sum(
-                    1 for r in tcp_all_records
-                    if r.disconnect_reason not in {"normal", "RST", "aborted", "broken_pipe", "incomplete"}
-                )
-
-                lines.append("")
-                lines.append(f"  TCP Statistics Summary:")
-                lines.append(f"    Total retransmits : {total_retx}")
-                lines.append(f"    Total lost packets: {total_lost}")
-                lines.append(f"    Connections w/ retx: {tcp_retx_conns}")
-                lines.append(f"    Connections w/ loss: {tcp_loss_conns}")
-                lines.append(f"    Avg bytes / conn  : {tcp_avg_bytes:.1f}")
-                lines.append(f"    Avg msgs / conn   : {tcp_avg_msgs:.1f}")
-                if rtt_vals:
-                    lines.append(f"    RTT avg           : {sum(rtt_vals)/len(rtt_vals):.2f}ms")
-                    lines.append(f"    RTT min           : {min(rtt_vals):.2f}ms")
-                    lines.append(f"    RTT max           : {max(rtt_vals):.2f}ms")
-                if rtt_var_vals:
-                    lines.append(f"    RTT var avg       : {sum(rtt_var_vals)/len(rtt_var_vals):.2f}ms")
-                    lines.append(f"    RTT var min       : {min(rtt_var_vals):.2f}ms")
-                    lines.append(f"    RTT var max       : {max(rtt_var_vals):.2f}ms")
-                lines.append(f"    Disconnect normal : {disconnect_normal}")
-                lines.append(f"    Disconnect RST    : {disconnect_rst}")
-                lines.append(f"    Disconnect aborted: {disconnect_aborted}")
-                lines.append(f"    Disconnect broken : {disconnect_broken}")
-                lines.append(f"    Disconnect incomplete: {disconnect_incomplete}")
-                lines.append(f"    Disconnect other  : {disconnect_other}")
+        Returns:
+            List of formatted statistics lines
+        """
+        if not tcp_records:
+            return []
+        
+        # Single-pass aggregation of TCP metrics
+        total_retx = 0
+        total_lost = 0
+        tcp_retx_conns = 0
+        tcp_loss_conns = 0
+        rtt_vals = []
+        rtt_var_vals = []
+        
+        for r in tcp_records:
+            retx = r.tcp_retransmits or 0
+            lost = r.tcp_lost_packets or 0
             
-            # Add UDP statistics summary if available
-            if has_udp_stats:
-                udp_records = [r for r in self.records if r.udp_expected_packets > 0]
-                total_expected = sum(r.udp_expected_packets for r in udp_records)
-                total_received = sum(r.messages_received for r in udp_records)
-                total_lost = sum(r.udp_lost_packets for r in udp_records)
-                loss_pct = (total_lost / total_expected * 100) if total_expected > 0 else 0
-                
-                lines.append("")
-                lines.append(f"  UDP Statistics Summary:")
-                lines.append(f"    Total expected    : {total_expected}")
-                lines.append(f"    Total received    : {total_received}")
-                lines.append(f"    Total lost        : {total_lost} ({loss_pct:.2f}%)")
-
-        lines.append("")
-        lines.append(f"  Final total bytes received: {total_bytes}")
-        lines.append("=" * 92)
-        return "\n".join(lines)
+            total_retx += retx
+            total_lost += lost
+            
+            if retx > 0:
+                tcp_retx_conns += 1
+            if lost > 0:
+                tcp_loss_conns += 1
+            
+            if r.tcp_rtt_ms is not None:
+                rtt_vals.append(r.tcp_rtt_ms)
+            if r.tcp_rtt_var_ms is not None:
+                rtt_var_vals.append(r.tcp_rtt_var_ms)
+        
+        # Calculate averages for all TCP connections
+        tcp_all_count = len(tcp_all_records)
+        if tcp_all_count > 0:
+            tcp_avg_bytes = sum(r.bytes_received for r in tcp_all_records) / tcp_all_count
+            tcp_avg_msgs = sum(r.messages_received for r in tcp_all_records) / tcp_all_count
+        else:
+            tcp_avg_bytes = 0.0
+            tcp_avg_msgs = 0.0
+        
+        # Disconnect reasons
+        disconnect_counts = self._count_disconnect_reasons(tcp_all_records)
+        
+        lines = [
+            "",
+            "  TCP Statistics Summary:",
+            f"    Total retransmits    : {total_retx}",
+            f"    Total lost packets   : {total_lost}",
+            f"    Connections w/ retx  : {tcp_retx_conns}",
+            f"    Connections w/ loss  : {tcp_loss_conns}",
+            f"    Avg bytes / conn     : {tcp_avg_bytes:.1f}",
+            f"    Avg msgs / conn      : {tcp_avg_msgs:.1f}",
+        ]
+        
+        lines.extend(self._format_rtt_stats("RTT", rtt_vals))
+        lines.extend(self._format_rtt_stats("RTT var", rtt_var_vals))
+        
+        # Format disconnect reasons with consistent alignment
+        lines.extend([
+            f"    Disconnect {label:<10}: {disconnect_counts[key]}"
+            for label, key in _DISCONNECT_LABELS
+        ])
+        
+        return lines
+    
+    def _count_disconnect_reasons(self, records: List[ConnectionRecord]) -> Dict[str, int]:
+        """Count disconnect reasons for TCP connections."""
+        reasons = {"normal": 0, "RST": 0, "aborted": 0, "broken_pipe": 0, "incomplete": 0, "other": 0}
+        known_reasons = {"normal", "RST", "aborted", "broken_pipe", "incomplete"}
+        
+        for r in records:
+            if r.disconnect_reason in known_reasons:
+                reasons[r.disconnect_reason] += 1
+            else:
+                reasons["other"] += 1
+        
+        return reasons
+    
+    def _format_udp_statistics(self, udp_records: List[ConnectionRecord]) -> List[str]:
+        """Generate UDP statistics summary section."""
+        if not udp_records:
+            return []
+        
+        total_expected = sum(r.udp_expected_packets for r in udp_records)
+        total_received = sum(r.messages_received for r in udp_records)
+        total_lost = sum(r.udp_lost_packets for r in udp_records)
+        loss_pct = (total_lost / total_expected * 100) if total_expected > 0 else 0
+        
+        return [
+            "",
+            "  UDP Statistics Summary:",
+            f"    Total expected    : {total_expected}",
+            f"    Total received    : {total_received}",
+            f"    Total lost        : {total_lost} ({loss_pct:.2f}%)",
+        ]
 
 
 
