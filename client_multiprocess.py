@@ -7,6 +7,8 @@ Provides 8-16x performance improvement on multicore systems
 
 import asyncio
 import argparse
+import copy
+import io
 import multiprocessing as mp
 import os
 import platform
@@ -35,12 +37,30 @@ class ProcessStats:
     tcp_lost_list: List[int]
 
 
+def _set_cpu_affinity(process_id: int) -> None:
+    """
+    Pin process to specific CPU core (Linux only).
+    
+    Args:
+        process_id: Process ID used to determine which CPU core to pin to
+    """
+    if not hasattr(os, 'sched_setaffinity'):
+        return
+    
+    try:
+        cpu_count = os.cpu_count() or 1
+        cpu_id = process_id % cpu_count
+        os.sched_setaffinity(0, {cpu_id})
+    except (OSError, AttributeError):
+        pass
+
+
 def worker_process(process_id: int, args, connections_per_process: int,
                    result_queue: mp.Queue, num_processes: int = 1, use_affinity: bool = False,
                    original_cps: Optional[float] = None):
     """
-    Worker process that runs its own event loop
-    Each process handles a portion of the total connections
+    Worker process that runs its own event loop.
+    Each process handles a portion of the total connections.
     
     Args:
         process_id: Unique ID for this worker process
@@ -52,16 +72,11 @@ def worker_process(process_id: int, args, connections_per_process: int,
         original_cps: Original total CPS before division (for timeout calculation)
     """
     # Set CPU affinity if requested (Linux only)
-    if use_affinity and hasattr(os, 'sched_setaffinity'):
-        try:
-            cpu_count = os.cpu_count() or 1
-            cpu_id = process_id % cpu_count
-            os.sched_setaffinity(0, {cpu_id})
-        except (OSError, AttributeError):
-            pass
+    if use_affinity:
+        _set_cpu_affinity(process_id)
     
-    # Modify args for this worker
-    worker_args = argparse.Namespace(**vars(args))
+    # Create a copy of args for this worker to avoid modifying the original
+    worker_args = copy.copy(args)
     worker_args.total = connections_per_process
     
     # CRITICAL: Divide CPS among workers to avoid overwhelming the server
@@ -74,97 +89,54 @@ def worker_process(process_id: int, args, connections_per_process: int,
     if original_cps is not None:
         worker_args.original_cps = original_cps
     
-    # Suppress individual worker summary output
+    # Suppress individual worker summary output by redirecting stdout
     # We'll aggregate all stats in the main process
-    import io
     original_stdout = sys.stdout
-    
     start_time = time.monotonic()
     
     try:
-        # Redirect stdout to capture output but suppress summary
-        output_buffer = io.StringIO()
-        sys.stdout = output_buffer
-        
-        # Run client and capture the stats by reading from the global stats object
-        # We need to import and run in a way that lets us access the stats
-        from client import run_client as client_run, Stats as ClientStats
-        
-        # Create a custom run that captures stats
-        async def run_with_stats_capture():
-            stats = ClientStats()
-            # Inject stats into the client run
-            import client
-            original_run = client.run_client
+        # Redirect stdout to suppress worker output (we only want aggregated stats)
+        try:
+            sys.stdout = io.StringIO()
             
-            async def wrapped_run(args):
-                # Access the stats object created in run_client
-                await original_run(args)
-                return stats
+            # Run client and capture the returned stats object
+            stats = asyncio.run(run_client(worker_args))
             
-            # Temporarily replace
-            client.run_client = wrapped_run
-            result_stats = await client_run(worker_args)
-            client.run_client = original_run
-            return result_stats if result_stats else stats
+            # Check for None return (edge case handling)
+            if stats is None:
+                raise RuntimeError(f'Worker {process_id}: run_client returned None')
+        finally:
+            # Restore stdout
+            sys.stdout = original_stdout
         
-        # For now, let's use a simpler approach: parse the output
-        asyncio.run(client_run(worker_args))
-        
-        # Restore stdout
-        sys.stdout = original_stdout
-        output = output_buffer.getvalue()
-        
-        # Parse stats from output (simple approach for now)
-        # Look for the summary section
+        # Calculate elapsed time
         elapsed = time.monotonic() - start_time
         
-        # Extract stats from output
-        total = success = failed = total_packets = 0
-        latencies = []
-        tcp_retransmits_list = []
-        tcp_rtt_list = []
-        tcp_lost_list = []
-        
-        for line in output.split('\n'):
-            if 'Total connections' in line:
-                total = int(line.split(':')[1].strip())
-            elif 'Successful' in line:
-                success = int(line.split(':')[1].strip())
-            elif 'Failed' in line:
-                failed = int(line.split(':')[1].strip())
-            elif 'Total packets sent' in line:
-                total_packets = int(line.split(':')[1].strip())
-            elif 'Latency avg' in line:
-                # We have latency data, but individual values are in connection logs
-                pass
-        
-        # Parse individual connection latencies from logs
-        for line in output.split('\n'):
-            if 'TCP connected' in line and 'latency=' in line:
-                try:
-                    lat_str = line.split('latency=')[1].split('ms')[0]
-                    latencies.append(float(lat_str))
-                except:
-                    pass
-        
+        # Convert Stats object to ProcessStats for queue transfer
         result = ProcessStats(
             process_id=process_id,
-            total=total,
-            success=success,
-            failed=failed,
-            total_packets=total_packets,
-            latencies=latencies,
+            total=stats.total,
+            success=stats.success,
+            failed=stats.failed,
+            total_packets=stats.total_packets,
+            latencies=stats.latencies.copy(),
             elapsed=elapsed,
-            tcp_retransmits_list=tcp_retransmits_list,
-            tcp_rtt_list=tcp_rtt_list,
-            tcp_lost_list=tcp_lost_list
+            tcp_retransmits_list=stats.tcp_retransmits_list.copy(),
+            tcp_rtt_list=stats.tcp_rtt_list.copy(),
+            tcp_lost_list=stats.tcp_lost_list.copy()
         )
         result_queue.put(result)
+        
     except Exception as e:
+        # Restore stdout on error
         sys.stdout = original_stdout
         import traceback
-        print(f"Worker {process_id} error: {e}\n{traceback.format_exc()}", file=sys.stderr)
+        error_msg = (
+            f"Worker {process_id} error: {e}\n"
+            f"Args: total={connections_per_process}, cps={worker_args.cps:.2f}\n"
+            f"{traceback.format_exc()}"
+        )
+        print(error_msg, file=sys.stderr)
         result_queue.put(None)
 
 
@@ -201,6 +173,126 @@ def check_and_set_ulimit():
             print(f"ulimit already sufficient: {soft_limit} open files")
     except Exception as e:
         print(f"Warning: Could not check ulimit: {e}", file=sys.stderr)
+
+
+def calculate_process_timeout(total_connections: int, cps: float, duration: float) -> float:
+    """
+    Calculate reasonable timeout for process completion.
+    
+    Args:
+        total_connections: Total number of connections
+        cps: Connections per second rate
+        duration: Duration each connection stays alive
+    
+    Returns:
+        Timeout in seconds
+    """
+    setup_time = total_connections / cps if cps > 0 else total_connections
+    
+    base_cleanup_buffer = 120.0  # 2 minutes default
+    additional_connection_blocks = total_connections // 5000
+    cleanup_buffer = base_cleanup_buffer + (additional_connection_blocks * 60.0)
+    
+    return setup_time + duration + cleanup_buffer
+
+
+def collect_stats_from_queue(result_queue: mp.Queue,
+                             all_stats: List[ProcessStats],
+                             collected_worker_ids: set) -> List[ProcessStats]:
+    """
+    Collect available stats from queue, avoiding duplicates.
+    
+    Args:
+        result_queue: Queue containing ProcessStats objects
+        all_stats: List to append collected stats to
+        collected_worker_ids: Set of worker IDs already collected
+    
+    Returns:
+        List of newly collected stats
+    """
+    new_stats = []
+    while not result_queue.empty():
+        stat = result_queue.get()
+        if stat and stat.process_id not in collected_worker_ids:
+            new_stats.append(stat)
+            all_stats.append(stat)
+            collected_worker_ids.add(stat.process_id)
+    return new_stats
+
+
+def print_progress_report(elapsed: float, timeout: float,
+                         new_stats: List[ProcessStats],
+                         num_processes: int, completed_count: int,
+                         running_count: int, connections_per_process: int,
+                         cps: float, duration: float, total_connections: int):
+    """
+    Print periodic progress report during execution.
+    
+    Args:
+        elapsed: Time elapsed since start
+        timeout: Total timeout value
+        new_stats: Newly collected stats since last report
+        num_processes: Total number of worker processes
+        completed_count: Number of workers that have completed
+        running_count: Number of workers still running
+        connections_per_process: Expected connections per worker
+        cps: Connections per second rate
+        duration: Connection duration
+        total_connections: Total connections across all workers
+    """
+    stats_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"\n[{stats_timestamp}] Progress Report (elapsed: {elapsed:.1f}s / timeout: {timeout:.1f}s)")
+    
+    # Show completed workers
+    if new_stats:
+        print(f"  Completed workers since last check:")
+        for s in new_stats:
+            print(f"    Worker {s.process_id}: {s.success}/{s.total} successful, "
+                  f"{s.total_packets} packets, {s.elapsed:.1f}s elapsed")
+    
+    # Show status
+    print(f"  Status: {completed_count}/{num_processes} workers completed, {running_count} still running")
+    
+    # Show expected progress for running workers
+    unreported = num_processes - completed_count
+    if unreported > 0 and total_connections > 0:
+        expected_setup_time = connections_per_process / cps if cps > 0 else 0
+        expected_total_time = expected_setup_time + duration
+        progress_pct = min(100, (elapsed / expected_total_time) * 100) if expected_total_time > 0 else 0
+        print(f"  Expected: ~{connections_per_process} connections/worker, "
+              f"~{expected_total_time:.1f}s total time")
+        print(f"  Progress: ~{progress_pct:.0f}% of expected time elapsed")
+
+
+def terminate_hung_processes(hung_processes: List[mp.Process]) -> None:
+    """
+    Terminate hung processes gracefully, then forcefully if needed.
+    
+    Args:
+        hung_processes: List of processes that exceeded timeout
+    """
+    if not hung_processes:
+        return
+    
+    terminate_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"\n[{terminate_timestamp}] Terminating {len(hung_processes)} hung process(es)...",
+          file=sys.stderr)
+    print(f"  Note: Stats from terminated processes will NOT be available", file=sys.stderr)
+    print(f"        Workers only report stats upon completion, not during execution", file=sys.stderr)
+    
+    # Attempt graceful termination
+    for p in hung_processes:
+        p.terminate()
+    
+    # Give them a moment to terminate gracefully
+    time.sleep(1)
+    
+    # Force kill if still alive
+    for p in hung_processes:
+        if p.is_alive():
+            p.kill()
+            kill_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            print(f"[{kill_timestamp}] Force killed process {p.pid}", file=sys.stderr)
 
 
 def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affinity: bool = False, stats_interval: float = 30.0):
@@ -263,20 +355,9 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
     
     print()
     
-    # Wait for all processes to complete with timeout
-    # Calculate reasonable timeout based on workload:
-    # - Connection setup time: total_connections / cps
-    # - Connection duration: args.duration (time each connection stays alive)
-    # - Cleanup buffer: default 2 minutes, plus 1 extra minute for every
-    #   additional 5K connections because teardown can take longer at scale
+    # Calculate timeout for process completion
     if args.total > 0:
-        setup_time = args.total / args.cps if args.cps > 0 else args.total
-        
-        base_cleanup_buffer = 120.0  # 2 minutes default
-        additional_connection_blocks = args.total // 5000
-        cleanup_buffer = base_cleanup_buffer + (additional_connection_blocks * 60.0)
-        
-        timeout_per_process = setup_time + args.duration + cleanup_buffer
+        timeout_per_process = calculate_process_timeout(args.total, args.cps, args.duration)
     else:
         # Should not reach here, but provide fallback
         timeout_per_process = 600.0  # 10 minutes default
@@ -308,46 +389,21 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
             break
         
         # Check if all processes have completed
-        all_done = all(not p.is_alive() for p in processes)
-        if all_done:
+        if all(not p.is_alive() for p in processes):
             break
         
-        # Collect stats from queue periodically
+        # Collect stats and print progress report periodically
         if stats_interval > 0 and (current_time - last_stats_time) >= stats_interval:
-            stats_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            print(f"\n[{stats_timestamp}] Progress Report (elapsed: {elapsed:.1f}s / timeout: {timeout_per_process:.1f}s)")
+            new_stats = collect_stats_from_queue(result_queue, all_stats, collected_worker_ids)
             
-            # Collect any available stats from queue (avoid duplicates)
-            temp_stats = []
-            while not result_queue.empty():
-                stat = result_queue.get()
-                if stat and stat.process_id not in collected_worker_ids:
-                    temp_stats.append(stat)
-                    all_stats.append(stat)
-                    collected_worker_ids.add(stat.process_id)
-            
-            # Show completed workers
-            if temp_stats:
-                print(f"  Completed workers since last check:")
-                for s in temp_stats:
-                    print(f"    Worker {s.process_id}: {s.success}/{s.total} successful, "
-                          f"{s.total_packets} packets, {s.elapsed:.1f}s elapsed")
-            
-            # Show status of workers that haven't reported yet
             completed = len(collected_worker_ids)
             running = sum(1 for p in processes if p.is_alive())
-            unreported = num_processes - completed
             
-            print(f"  Status: {completed}/{num_processes} workers completed, {running} still running")
-            
-            if unreported > 0 and args.total > 0:
-                # Show expected progress for running workers
-                expected_setup_time = connections_per_process / args.cps if args.cps > 0 else 0
-                expected_total_time = expected_setup_time + args.duration
-                progress_pct = min(100, (elapsed / expected_total_time) * 100) if expected_total_time > 0 else 0
-                print(f"  Expected: ~{connections_per_process} connections/worker, "
-                      f"~{expected_total_time:.1f}s total time")
-                print(f"  Progress: ~{progress_pct:.0f}% of expected time elapsed")
+            print_progress_report(
+                elapsed, timeout_per_process, new_stats, num_processes,
+                completed, running, connections_per_process,
+                args.cps, args.duration, args.total
+            )
             
             last_stats_time = current_time
         
@@ -355,28 +411,10 @@ def run_multiprocess_client(args, num_processes: Optional[int] = None, use_affin
         time.sleep(0.5)
     
     # Terminate any hung processes
-    if hung_processes:
-        terminate_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"\n[{terminate_timestamp}] Terminating {len(hung_processes)} hung process(es)...", file=sys.stderr)
-        print(f"  Note: Stats from terminated processes will NOT be available", file=sys.stderr)
-        print(f"        Workers only report stats upon completion, not during execution", file=sys.stderr)
-        for p in hung_processes:
-            p.terminate()
-        # Give them a moment to terminate gracefully
-        time.sleep(1)
-        # Force kill if still alive
-        for p in hung_processes:
-            if p.is_alive():
-                p.kill()
-                kill_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                print(f"[{kill_timestamp}] Force killed process {p.pid}", file=sys.stderr)
+    terminate_hung_processes(hung_processes)
     
-    # Collect any remaining stats from queue (avoid duplicates)
-    while not result_queue.empty():
-        stat = result_queue.get()
-        if stat and stat.process_id not in collected_worker_ids:
-            all_stats.append(stat)
-            collected_worker_ids.add(stat.process_id)
+    # Collect any remaining stats from queue
+    collect_stats_from_queue(result_queue, all_stats, collected_worker_ids)
     
     # Print aggregated summary
     print_aggregated_summary(all_stats, num_processes)
