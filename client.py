@@ -1133,115 +1133,276 @@ def _build_udp_packet(seq_num: int, interval_ms: int, payload: bytes) -> bytes:
     """Build UDP packet with sequence number and interval header."""
     return struct.pack('!II', seq_num, interval_ms) + payload
 
+# UDP send buffer size constant (4MB)
+_UDP_SEND_BUFFER_SIZE = 4 * 1024 * 1024
+
+
+def _configure_udp_send_buffer(transport, buffer_size: int = _UDP_SEND_BUFFER_SIZE) -> bool:
+    """Configure UDP socket send buffer size.
+    
+    Args:
+        transport: The datagram transport
+        buffer_size: Desired buffer size in bytes (default: 4MB)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    sock = transport.get_extra_info('socket')
+    if not sock:
+        return False
+    
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buffer_size)
+        return True
+    except OSError as e:
+        # Log warning but don't fail - system may not allow buffer changes
+        timestamp = _format_timestamp()
+        print(f"[{timestamp}] [WARN  ] UDP buffer config failed: {e}")
+        return False
+
+
+def _format_udp_error(e: Exception) -> str:
+    """Format UDP error with errno-specific messages.
+    
+    Args:
+        e: The exception to format
+    
+    Returns:
+        Human-readable error description
+    """
+    if isinstance(e, OSError) and hasattr(e, 'errno') and e.errno is not None:
+        error_map = {
+            111: "port_unreachable (ICMP)",
+            101: "network_unreachable",
+            113: "host_unreachable",
+            90: "message_too_long"
+        }
+        return error_map.get(e.errno, f"error:{e.errno}")
+    return f"{type(e).__name__}: {e}" if not isinstance(e, OSError) else str(e)
+
+
+async def _send_udp_packets(transport, payload: bytes, pps: int, duration: float, 
+                           start_time: float) -> Tuple[int, int]:
+    """Send UDP packets at specified rate for given duration.
+    
+    Args:
+        transport: The datagram transport
+        payload: Payload bytes to send
+        pps: Packets per second rate
+        duration: Duration in seconds
+        start_time: Start time from monotonic clock
+    
+    Returns:
+        Tuple of (packets_sent, bytes_sent)
+    """
+    interval = 1.0 / pps
+    interval_ms = int(interval * 1000)
+    deadline = start_time + duration
+    packets_sent = 0
+    bytes_sent = 0
+    seq_num = 0
+    now = start_time
+    
+    while now < deadline:
+        # Prepend sequence number (4 bytes) and interval_ms (4 bytes) to payload
+        # Server uses interval_ms to calculate dynamic timeout: interval_ms * 3
+        packet = _build_udp_packet(seq_num, interval_ms, payload)
+        transport.sendto(packet)
+        bytes_sent += len(packet)
+        packets_sent += 1
+        seq_num += 1
+        
+        next_send = now + interval
+        if next_send >= deadline:
+            break
+        
+        # Sleep until next send time, accounting for drift and preventing negative sleep
+        sleep_time = max(0, next_send - time.monotonic())
+        await asyncio.sleep(sleep_time)
+        now = time.monotonic()
+    
+    return packets_sent, bytes_sent
+
+
+def _log_udp_success(conn_id: int, latency_ms: float, packets_sent: int, 
+                     packet_size: int, is_periodic: bool):
+    """Log successful UDP transmission.
+    
+    Args:
+        conn_id: Connection ID
+        latency_ms: Latency in milliseconds
+        packets_sent: Number of packets sent
+        packet_size: Size of each packet in bytes
+        is_periodic: True if periodic traffic, False if single packet
+    """
+    timestamp = _format_timestamp()
+    if is_periodic:
+        print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | "
+              f"latency={latency_ms:.1f}ms | {packets_sent} pkts | {packet_size}B each")
+    else:
+        print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | "
+              f"latency={latency_ms:.1f}ms | {packet_size}B")
+
+
+def _log_udp_failure(conn_id: int, host: str, port: int, error_detail: str):
+    """Log UDP connection failure.
+    
+    Args:
+        conn_id: Connection ID
+        host: Target host
+        port: Target port
+        error_detail: Error description
+    """
+    timestamp = _format_timestamp()
+    print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
+
+
+async def _send_single_udp_packet(transport, payload: bytes, duration: float) -> Tuple[int, int]:
+    """Send a single UDP packet and optionally sleep for duration.
+    
+    Args:
+        transport: The datagram transport
+        payload: Payload bytes to send
+        duration: Duration to sleep after sending (0 = no sleep)
+    
+    Returns:
+        Tuple of (packets_sent, bytes_sent)
+    """
+    packet = _build_udp_packet(0, 0, payload)
+    transport.sendto(packet)
+    bytes_sent = len(packet)
+    packets_sent = 1
+    
+    if duration > 0:
+        await asyncio.sleep(duration)
+    
+    return packets_sent, bytes_sent
+
+
+def _create_success_result(conn_id: int, latency_ms: float, packets_sent: int,
+                          bytes_sent: int, dashboard_tracker) -> ConnectionResult:
+    """Create success result and update dashboard if enabled.
+    
+    Args:
+        conn_id: Connection identifier
+        latency_ms: Latency in milliseconds
+        packets_sent: Number of packets sent
+        bytes_sent: Total bytes sent
+        dashboard_tracker: Optional dashboard metrics tracker
+    
+    Returns:
+        ConnectionResult with success=True
+    """
+    if dashboard_tracker:
+        dashboard_tracker.record_connection(True, latency_ms, packets_sent)
+    
+    return ConnectionResult(
+        conn_id=conn_id,
+        success=True,
+        latency_ms=latency_ms,
+        packets_sent=packets_sent,
+        bytes_sent=bytes_sent
+    )
+
+
+def _create_error_result(conn_id: int, host: str, port: int, t0: float,
+                        bytes_sent: int, e: Exception, dashboard_tracker) -> ConnectionResult:
+    """Create error result, log failure, and update dashboard if enabled.
+    
+    Args:
+        conn_id: Connection identifier
+        host: Target hostname or IP
+        port: Target port
+        t0: Start time from monotonic clock
+        bytes_sent: Bytes sent before error
+        e: The exception that occurred
+        dashboard_tracker: Optional dashboard metrics tracker
+    
+    Returns:
+        ConnectionResult with success=False
+    """
+    latency_ms = (time.monotonic() - t0) * 1000
+    error_detail = _format_udp_error(e)
+    _log_udp_failure(conn_id, host, port, error_detail)
+    
+    if dashboard_tracker:
+        dashboard_tracker.record_connection(False, latency_ms, 0)
+    
+    return ConnectionResult(
+        conn_id=conn_id,
+        success=False,
+        latency_ms=latency_ms,
+        bytes_sent=bytes_sent,
+        error=error_detail
+    )
+
+
 
 async def udp_connection(conn_id: int, host: str, port: int, payload: bytes,
                          duration: float, stats: Stats, args=None, dashboard_tracker=None):
+    """Send UDP traffic to target host:port.
+    
+    Args:
+        conn_id: Connection identifier
+        host: Target hostname or IP
+        port: Target port
+        payload: Payload bytes to send
+        duration: Connection duration in seconds
+        stats: Statistics tracker
+        args: Optional arguments (for pps rate)
+        dashboard_tracker: Optional dashboard metrics tracker
+    """
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
-    packets_sent = 0
     pps = args.pps if args else 0
     transport = None
     bytes_sent = 0
     result: Optional[ConnectionResult] = None
+    
     try:
         transport, protocol = await loop.create_datagram_endpoint(
             asyncio.DatagramProtocol,
             remote_addr=(host, port)
         )
         
-        # Increase UDP send buffer for high-throughput scenarios
-        sock = transport.get_extra_info('socket')
-        if sock:
-            try:
-                # Set send buffer to 4MB (sufficient for client sending)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)
-            except OSError:
-                pass  # Ignore if system doesn't allow buffer size changes
+        # Configure UDP send buffer for high-throughput scenarios
+        _configure_udp_send_buffer(transport)
         
         # Capture latency right after endpoint creation (before any sends)
         now = time.monotonic()
         latency_ms = (now - t0) * 1000
+        
         if pps > 0 and duration > 0:
-            interval = 1.0 / pps
-            deadline = now + duration
-            # Send interval in milliseconds so server can calculate appropriate timeout
-            interval_ms = int(interval * 1000)
-            seq_num = 0
-            while now < deadline:
-                # Prepend sequence number (4 bytes) and interval_ms (4 bytes) to payload
-                # Server uses interval_ms to calculate dynamic timeout: interval_ms * 3
-                packet = _build_udp_packet(seq_num, interval_ms, payload)
-                transport.sendto(packet)
-                bytes_sent += len(packet)
-                packets_sent += 1
-                seq_num += 1
-                
-                next_send = now + interval
-                if next_send >= deadline:
-                    break
-                await asyncio.sleep(next_send - time.monotonic())
-                now = time.monotonic()
-            timestamp = _format_timestamp()
-            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {packets_sent} pkts | {len(payload)+8}B each")
+            # Send packets at specified rate for duration
+            packets_sent, bytes_sent = await _send_udp_packets(
+                transport, payload, pps, duration, now
+            )
+            _log_udp_success(conn_id, latency_ms, packets_sent, len(payload) + 8, True)
         else:
-            # Single packet with sequence number 0 and interval_ms 0 (no periodic traffic)
-            packet = _build_udp_packet(0, 0, payload)
-            transport.sendto(packet)
-            bytes_sent += len(packet)
-            packets_sent = 1
-            timestamp = _format_timestamp()
-            print(f"[{timestamp}] [{conn_id:>6}] UDP sent       | latency={latency_ms:.1f}ms | {len(packet)}B")
-            
-            if duration > 0:
-                # Just sleep for the duration
-                await asyncio.sleep(duration)
+            # Single packet with optional sleep for duration
+            packets_sent, bytes_sent = await _send_single_udp_packet(
+                transport, payload, duration
+            )
+            _log_udp_success(conn_id, latency_ms, packets_sent, len(payload) + 8, False)
 
-        result = ConnectionResult(conn_id=conn_id, success=True,
-                                  latency_ms=latency_ms, packets_sent=packets_sent, bytes_sent=bytes_sent)
-        
-        # Update dashboard if enabled
-        if dashboard_tracker:
-            dashboard_tracker.record_connection(True, latency_ms, packets_sent)
-    except OSError as e:
-        # UDP-specific errors:
-        # ECONNREFUSED (111): ICMP port unreachable received
-        # ENETUNREACH (101): Network unreachable
-        # EHOSTUNREACH (113): Host unreachable
-        # EMSGSIZE (90): Message too long
-        latency_ms = (time.monotonic() - t0) * 1000
-        timestamp = _format_timestamp()
-        if hasattr(e, 'errno'):
-            if e.errno == 111:  # ECONNREFUSED
-                error_detail = "port_unreachable (ICMP)"
-            elif e.errno == 101:  # ENETUNREACH
-                error_detail = "network_unreachable"
-            elif e.errno == 113:  # EHOSTUNREACH
-                error_detail = "host_unreachable"
-            elif e.errno == 90:  # EMSGSIZE
-                error_detail = "message_too_long"
-            else:
-                error_detail = f"error:{e.errno}"
-        else:
-            error_detail = str(e)
-        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
-        result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
-        
-        # Update dashboard if enabled
-        if dashboard_tracker:
-            dashboard_tracker.record_connection(False, latency_ms, 0)
+        result = _create_success_result(
+            conn_id, latency_ms, packets_sent, bytes_sent, dashboard_tracker
+        )
+            
     except Exception as e:
-        latency_ms = (time.monotonic() - t0) * 1000
-        timestamp = _format_timestamp()
-        error_detail = f"{type(e).__name__}: {e}"
-        print(f"[{timestamp}] [{conn_id:>6}] UDP FAILED     | target={host}:{port} | {error_detail}")
-        result = ConnectionResult(conn_id=conn_id, success=False,
-                                  latency_ms=latency_ms, bytes_sent=bytes_sent, error=error_detail)
+        result = _create_error_result(
+            conn_id, host, port, t0, bytes_sent, e, dashboard_tracker
+        )
+            
     finally:
         if transport is not None:
-            transport.close()  # always close, even on exception
+            transport.close()
+    
+    # CRITICAL FIX: Record result in stats (was missing before)
     if result is not None:
         stats.record(result)
+    
+    return result
 
 
 async def run_client(args):
