@@ -8,6 +8,7 @@ import asyncio
 import argparse
 import atexit
 import hashlib
+import logging
 import os
 import platform
 import resource
@@ -447,11 +448,80 @@ def _format_debug_log(conn_id: int, message: str, **kwargs) -> str:
         details = " | ".join(f"{k}={v}" for k, v in kwargs.items())
         parts.append(f" | {details}")
     
+
+def _calculate_backoff_delay(attempt: int) -> float:
+    """
+    Calculate exponential backoff delay for retry attempts.
+    
+    Strategy:
+    - Attempt 0 (first): 0s (no delay)
+    - Attempt 1 (first retry): 2s
+    - Attempt 2 (second retry): 5s
+    - Attempt 3+ (third+ retry): 10s (capped)
+    
+    Args:
+        attempt: Zero-based attempt number (0 = first attempt, 1 = first retry)
+    
+    Returns:
+        Delay in seconds before the next attempt
+    """
+    if attempt == 0:
+        return 0.0
+    return min(2.0 * (2.5 ** (attempt - 1)), 10.0)
+
+
+def _log_retry_attempt(error: Exception, conn_id: int, attempt: int, 
+                       max_retries: int, host: str, port: int, 
+                       timeout: float, is_final: bool,
+                       logger: Optional[logging.Logger] = None) -> None:
+    """
+    Log retry attempt with appropriate detail based on error type and attempt number.
+    
+    Args:
+        error: The exception that triggered the retry
+        conn_id: Connection ID for logging
+        attempt: Zero-based attempt number
+        max_retries: Maximum number of retry attempts
+        host: Target host
+        port: Target port
+        timeout: Connection timeout in seconds
+        is_final: Whether this is the final attempt
+        logger: Optional logger instance (uses print if None)
+    """
+    timestamp = _format_timestamp()
+    
+    def _log(message: str):
+        if logger:
+            if is_final:
+                logger.error(message)
+            else:
+                logger.warning(message)
+        else:
+            print(message)
+    
+    if isinstance(error, asyncio.TimeoutError):
+        elapsed_ms = timeout * 1000
+        detail = _format_timeout_detail(
+            phase="connect", host=host, port=port, timeout=timeout,
+            elapsed_ms=elapsed_ms, attempt=attempt + 1, max_retries=max_retries
+        )
+        if is_final:
+            _log(f"[{timestamp}] [{conn_id:>6}] ✗ All attempts failed | {detail}")
+        else:
+            _log(f"[{timestamp}] [{conn_id:>6}] ✗ {detail}")
+    
+    elif isinstance(error, ConnectionResetError):
+        if is_final:
+            _log(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with RST")
+        else:
+            _log(f"[{timestamp}] [{conn_id:>6}] ✗ Connection reset on attempt {attempt + 1}/{max_retries}")
+
     return "".join(parts)
 
 
 async def connect_with_retry(host: str, port: int, timeout: float,
-                             max_retries: int = 3, conn_id: int = 0) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+                             max_retries: int = 3, conn_id: int = 0,
+                             logger: Optional[logging.Logger] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """
     Attempt to connect with exponential backoff retry logic.
     
@@ -477,6 +547,7 @@ async def connect_with_retry(host: str, port: int, timeout: float,
         timeout: Connection timeout in seconds (kept constant across retries)
         max_retries: Maximum number of retry attempts (default: 3)
         conn_id: Connection ID for logging
+        logger: Optional logger instance (uses print if None)
     
     Returns:
         Tuple of (reader, writer) on success
@@ -487,16 +558,20 @@ async def connect_with_retry(host: str, port: int, timeout: float,
         ConnectionRefusedError: If connection is refused (no retry)
         OSError: For other connection errors (no retry)
     """
-    last_error = None
+    def _log(message: str, level: str = 'info'):
+        """Helper to log via logger or print."""
+        if logger:
+            getattr(logger, level)(message)
+        else:
+            print(message)
     
     for attempt in range(max_retries):
         try:
             # Apply backoff delay before retry (not on first attempt)
-            if attempt > 0:
-                # Exponential backoff: 2s, 5s, 10s
-                backoff_delay = min(2.0 * (2.5 ** (attempt - 1)), 10.0)
+            backoff_delay = _calculate_backoff_delay(attempt)
+            if backoff_delay > 0:
                 timestamp = _format_timestamp()
-                print(f"[{timestamp}] [{conn_id:>6}] Retry {attempt}/{max_retries-1} after {backoff_delay:.1f}s delay | timeout={timeout:.1f}s")
+                _log(f"[{timestamp}] [{conn_id:>6}] Retry {attempt}/{max_retries-1} after {backoff_delay:.1f}s delay | timeout={timeout:.1f}s")
                 await asyncio.sleep(backoff_delay)
             
             # Attempt connection with consistent timeout
@@ -505,42 +580,18 @@ async def connect_with_retry(host: str, port: int, timeout: float,
                 timeout=timeout
             )
             
-            # Success
+            # Success - log if this was a retry
             if attempt > 0:
                 timestamp = _format_timestamp()
-                print(f"[{timestamp}] [{conn_id:>6}] ✓ Retry succeeded after {attempt} attempt(s)")
+                _log(f"[{timestamp}] [{conn_id:>6}] ✓ Connected after {attempt} retry(s)")
             
             return reader, writer
             
-        except asyncio.TimeoutError as e:
-            last_error = e
-            timestamp = _format_timestamp()
-            elapsed_ms = timeout * 1000
-            timeout_detail = _format_timeout_detail(
-                phase="connect",
-                host=host,
-                port=port,
-                timeout=timeout,
-                elapsed_ms=elapsed_ms,
-                attempt=attempt + 1,
-                max_retries=max_retries,
-            )
-            if attempt < max_retries - 1:
-                print(f"[{timestamp}] [{conn_id:>6}] ✗ {timeout_detail}")
-            else:
-                # Final attempt failed
-                print(f"[{timestamp}] [{conn_id:>6}] ✗ All attempts failed | {timeout_detail}")
-                raise
-        
-        except ConnectionResetError as e:
-            # Retry on RST - may be transient server issue (crash, overload, etc.)
-            last_error = e
-            timestamp = _format_timestamp()
-            if attempt < max_retries - 1:
-                print(f"[{timestamp}] [{conn_id:>6}] ✗ Connection reset on attempt {attempt + 1}/{max_retries}")
-            else:
-                # Final attempt failed
-                print(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with RST")
+        except (asyncio.TimeoutError, ConnectionResetError) as e:
+            # Retry on timeout or RST - may be transient server issue
+            is_final_attempt = (attempt >= max_retries - 1)
+            _log_retry_attempt(e, conn_id, attempt, max_retries, host, port, timeout, is_final_attempt, logger)
+            if is_final_attempt:
                 raise
         
         except (ConnectionRefusedError, OSError) as e:
@@ -548,13 +599,11 @@ async def connect_with_retry(host: str, port: int, timeout: float,
             # These indicate server is down/unreachable, not transient issues
             timestamp = _format_timestamp()
             error_type = type(e).__name__
-            print(f"[{timestamp}] [{conn_id:>6}] ✗ {error_type} - no retry")
+            _log(f"[{timestamp}] [{conn_id:>6}] ✗ {error_type} - no retry", level='error')
             raise
     
-    # Should not reach here, but raise last error if we do
-    if last_error:
-        raise last_error
-    raise RuntimeError("Unexpected retry loop exit")
+    # Unreachable: loop always raises on final attempt
+    raise RuntimeError("connect_with_retry: unexpected code path")
 
 
 def make_payload(args) -> bytes:
