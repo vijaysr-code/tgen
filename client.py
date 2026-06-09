@@ -116,6 +116,46 @@ class ConnectionResult:
     tcp_reordering: Optional[int] = None
 
 
+# Formatting constants for summary output
+_SUMMARY_WIDTH = 55
+_SUMMARY_SEPARATOR = "=" * _SUMMARY_WIDTH
+_INDENT = "  "
+_TCP_INDENT = "    "
+
+
+def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Safe division returning default when denominator is zero."""
+    return numerator / denominator if denominator > 0 else default
+
+
+@dataclass
+class SummaryStats:
+    """Pre-computed statistics for efficient summary generation."""
+    elapsed: float
+    rate: float
+    # Latency statistics
+    avg_latency: float = 0.0
+    min_latency: float = 0.0
+    max_latency: float = 0.0
+    # TCP statistics
+    total_retransmits: int = 0
+    avg_retransmits: float = 0.0
+    retx_connections: int = 0
+    loss_connections: int = 0
+    avg_bytes_per_conn: float = 0.0
+    avg_packets_per_conn: float = 0.0
+    # RTT statistics
+    avg_rtt: float = 0.0
+    min_rtt: float = 0.0
+    max_rtt: float = 0.0
+    # RTT variance statistics
+    avg_rtt_var: float = 0.0
+    min_rtt_var: float = 0.0
+    max_rtt_var: float = 0.0
+    # Lost packets
+    total_lost: int = 0
+
+
 @dataclass
 class Stats:
     total: int = 0
@@ -141,6 +181,8 @@ class Stats:
     # Batch processing for performance
     _batch_buffer: List[ConnectionResult] = field(default_factory=list)
     _batch_size: int = 100
+    # Cached statistics for performance
+    _cached_stats: Optional[SummaryStats] = None
 
     def record(self, result: ConnectionResult):
         """Record connection result with batch processing for performance."""
@@ -190,84 +232,155 @@ class Stats:
         self._batch_buffer.clear()
     
     def finalize(self):
-        """Flush any remaining buffered results before generating summary."""
+        """Flush any remaining buffered results and compute cached statistics."""
         if self._batch_buffer:
             self._flush_batch()
+        
+        # Compute all statistics once for efficient summary generation
+        elapsed = time.monotonic() - self.start_time
+        rate = _safe_divide(self.total, elapsed)
+        
+        # Latency statistics
+        avg_latency = _safe_divide(sum(self.latencies), len(self.latencies)) if self.latencies else 0.0
+        min_latency = min(self.latencies) if self.latencies else 0.0
+        max_latency = max(self.latencies) if self.latencies else 0.0
+        
+        # TCP statistics
+        total_retransmits = sum(self.tcp_retransmits_list) if self.tcp_retransmits_list else 0
+        avg_retransmits = _safe_divide(total_retransmits, len(self.tcp_retransmits_list))
+        retx_connections = sum(1 for v in self.tcp_retransmits_list if v > 0) if self.tcp_retransmits_list else 0
+        loss_connections = sum(1 for v in self.tcp_lost_list if v > 0) if self.tcp_lost_list else 0
+        avg_bytes_per_conn = _safe_divide(self.total_bytes_sent, self.success)
+        avg_packets_per_conn = _safe_divide(self.total_packets, self.success)
+        
+        # RTT statistics
+        avg_rtt = _safe_divide(sum(self.tcp_rtt_list), len(self.tcp_rtt_list)) if self.tcp_rtt_list else 0.0
+        min_rtt = min(self.tcp_rtt_list) if self.tcp_rtt_list else 0.0
+        max_rtt = max(self.tcp_rtt_list) if self.tcp_rtt_list else 0.0
+        
+        # RTT variance statistics
+        avg_rtt_var = _safe_divide(sum(self.tcp_rtt_var_list), len(self.tcp_rtt_var_list)) if self.tcp_rtt_var_list else 0.0
+        min_rtt_var = min(self.tcp_rtt_var_list) if self.tcp_rtt_var_list else 0.0
+        max_rtt_var = max(self.tcp_rtt_var_list) if self.tcp_rtt_var_list else 0.0
+        
+        # Lost packets
+        total_lost = sum(self.tcp_lost_list) if self.tcp_lost_list else 0
+        
+        self._cached_stats = SummaryStats(
+            elapsed=elapsed,
+            rate=rate,
+            avg_latency=avg_latency,
+            min_latency=min_latency,
+            max_latency=max_latency,
+            total_retransmits=total_retransmits,
+            avg_retransmits=avg_retransmits,
+            retx_connections=retx_connections,
+            loss_connections=loss_connections,
+            avg_bytes_per_conn=avg_bytes_per_conn,
+            avg_packets_per_conn=avg_packets_per_conn,
+            avg_rtt=avg_rtt,
+            min_rtt=min_rtt,
+            max_rtt=max_rtt,
+            avg_rtt_var=avg_rtt_var,
+            min_rtt_var=min_rtt_var,
+            max_rtt_var=max_rtt_var,
+            total_lost=total_lost,
+        )
+    
+    def _format_basic_stats(self, stats: SummaryStats) -> List[str]:
+        """Format basic connection statistics."""
+        timestamp = _format_timestamp()
+        return [
+            f"{_INDENT}CLIENT SUMMARY [{timestamp}]",
+            _SUMMARY_SEPARATOR,
+            f"{_INDENT}Elapsed time      : {stats.elapsed:.2f}s",
+            f"{_INDENT}Total connections : {self.total}",
+            f"{_INDENT}Successful        : {self.success}",
+            f"{_INDENT}Failed            : {self.failed}",
+            f"{_INDENT}Observed rate     : {stats.rate:.2f} conn/s",
+            f"{_INDENT}Total packets sent: {self.total_packets}",
+            f"{_INDENT}Total bytes sent  : {self.total_bytes_sent}",
+        ]
+    
+    def _format_latency_stats(self, stats: SummaryStats) -> List[str]:
+        """Format latency statistics."""
+        if not self.latencies:
+            return []
+        return [
+            f"{_INDENT}Latency avg       : {stats.avg_latency:.2f}ms",
+            f"{_INDENT}Latency min       : {stats.min_latency:.2f}ms",
+            f"{_INDENT}Latency max       : {stats.max_latency:.2f}ms",
+        ]
+    
+    def _format_tcp_stats(self, stats: SummaryStats) -> List[str]:
+        """Format TCP statistics."""
+        if not self.tcp_retransmits_list:
+            return []
+        return [
+            "",
+            f"{_INDENT}TCP Statistics:",
+            f"{_TCP_INDENT}Total retransmits : {stats.total_retransmits}",
+            f"{_TCP_INDENT}Avg retransmits   : {stats.avg_retransmits:.1f} per conn",
+            f"{_TCP_INDENT}Connections w/ retx: {stats.retx_connections}",
+            f"{_TCP_INDENT}Connections w/ loss: {stats.loss_connections}",
+            f"{_TCP_INDENT}Avg bytes / conn  : {stats.avg_bytes_per_conn:.1f}",
+            f"{_TCP_INDENT}Avg pkts / conn   : {stats.avg_packets_per_conn:.1f}",
+            f"{_TCP_INDENT}Total retries     : {self.total_retry_attempts}",
+        ]
+    
+    def _format_rtt_stats(self, stats: SummaryStats) -> List[str]:
+        """Format RTT and RTT variance statistics."""
+        lines = []
+        if self.tcp_rtt_list:
+            lines.extend([
+                f"{_TCP_INDENT}RTT avg           : {stats.avg_rtt:.2f}ms",
+                f"{_TCP_INDENT}RTT min           : {stats.min_rtt:.2f}ms",
+                f"{_TCP_INDENT}RTT max           : {stats.max_rtt:.2f}ms",
+            ])
+        if self.tcp_rtt_var_list:
+            lines.extend([
+                f"{_TCP_INDENT}RTT var avg       : {stats.avg_rtt_var:.2f}ms",
+                f"{_TCP_INDENT}RTT var min       : {stats.min_rtt_var:.2f}ms",
+                f"{_TCP_INDENT}RTT var max       : {stats.max_rtt_var:.2f}ms",
+            ])
+        return lines
+    
+    def _format_lost_packets(self, stats: SummaryStats) -> List[str]:
+        """Format lost packets statistics."""
+        if not self.tcp_lost_list or stats.total_lost == 0:
+            return []
+        return [f"{_TCP_INDENT}Total lost packets: {stats.total_lost}"]
+    
+    def _format_failure_stats(self) -> List[str]:
+        """Format failure statistics by type."""
+        if not self.failed:
+            return []
+        return [
+            f"{_TCP_INDENT}Failures RST      : {self.rst_failures}",
+            f"{_TCP_INDENT}Failures timeout  : {self.timeout_failures}",
+            f"{_TCP_INDENT}Failures refused  : {self.refused_failures}",
+            f"{_TCP_INDENT}Failures aborted  : {self.aborted_failures}",
+            f"{_TCP_INDENT}Failures broken   : {self.broken_pipe_failures}",
+            f"{_TCP_INDENT}Failures other    : {self.other_failures}",
+        ]
 
     def summary(self) -> str:
         """Generate summary statistics. Flushes any pending batch updates first."""
-        self.finalize()  # Flush any remaining buffered results
-        elapsed = time.monotonic() - self.start_time
-        rate = self.total / elapsed if elapsed > 0 else 0
-        timestamp = _format_timestamp()
-        lines = [
-            "\n" + "=" * 55,
-            f"  CLIENT SUMMARY [{timestamp}]",
-            "=" * 55,
-            f"  Elapsed time      : {elapsed:.2f}s",
-            f"  Total connections : {self.total}",
-            f"  Successful        : {self.success}",
-            f"  Failed            : {self.failed}",
-            f"  Observed rate     : {rate:.2f} conn/s",
-            f"  Total packets sent: {self.total_packets}",
-            f"  Total bytes sent  : {self.total_bytes_sent}",
-        ]
-        if self.latencies:
-            avg = sum(self.latencies) / len(self.latencies)
-            lines += [
-                f"  Latency avg       : {avg:.2f}ms",
-                f"  Latency min       : {min(self.latencies):.2f}ms",
-                f"  Latency max       : {max(self.latencies):.2f}ms",
-            ]
-
-        # TCP statistics summary
-        if self.tcp_retransmits_list:
-            total_retx = sum(self.tcp_retransmits_list)
-            retx_conns = sum(1 for v in self.tcp_retransmits_list if v > 0)
-            loss_conns = sum(1 for v in self.tcp_lost_list if v > 0)
-            avg_bytes = (self.total_bytes_sent / self.success) if self.success else 0.0
-            avg_pkts = (self.total_packets / self.success) if self.success else 0.0
-            lines += [
-                "",
-                "  TCP Statistics:",
-                f"    Total retransmits : {total_retx}",
-                f"    Avg retransmits   : {total_retx/len(self.tcp_retransmits_list):.1f} per conn",
-                f"    Connections w/ retx: {retx_conns}",
-                f"    Connections w/ loss: {loss_conns}",
-                f"    Avg bytes / conn  : {avg_bytes:.1f}",
-                f"    Avg pkts / conn   : {avg_pkts:.1f}",
-                f"    Total retries     : {self.total_retry_attempts}",
-            ]
-        if self.tcp_rtt_list:
-            avg_rtt = sum(self.tcp_rtt_list) / len(self.tcp_rtt_list)
-            lines += [
-                f"    RTT avg           : {avg_rtt:.2f}ms",
-                f"    RTT min           : {min(self.tcp_rtt_list):.2f}ms",
-                f"    RTT max           : {max(self.tcp_rtt_list):.2f}ms",
-            ]
-        if self.tcp_rtt_var_list:
-            lines += [
-                f"    RTT var avg       : {sum(self.tcp_rtt_var_list)/len(self.tcp_rtt_var_list):.2f}ms",
-                f"    RTT var min       : {min(self.tcp_rtt_var_list):.2f}ms",
-                f"    RTT var max       : {max(self.tcp_rtt_var_list):.2f}ms",
-            ]
-        if self.tcp_lost_list:
-            total_lost = sum(self.tcp_lost_list)
-            if total_lost > 0:
-                lines += [
-                    f"    Total lost packets: {total_lost}",
-                ]
-        if self.failed:
-            lines += [
-                f"    Failures RST      : {self.rst_failures}",
-                f"    Failures timeout  : {self.timeout_failures}",
-                f"    Failures refused  : {self.refused_failures}",
-                f"    Failures aborted  : {self.aborted_failures}",
-                f"    Failures broken   : {self.broken_pipe_failures}",
-                f"    Failures other    : {self.other_failures}",
-            ]
-
-        lines.append("=" * 55)
+        self.finalize()  # Flush any remaining buffered results and compute cached stats
+        
+        if self._cached_stats is None:
+            return "\n" + _SUMMARY_SEPARATOR + "\n" + f"{_INDENT}No statistics available" + "\n" + _SUMMARY_SEPARATOR
+        
+        stats = self._cached_stats
+        lines = ["\n" + _SUMMARY_SEPARATOR]
+        lines.extend(self._format_basic_stats(stats))
+        lines.extend(self._format_latency_stats(stats))
+        lines.extend(self._format_tcp_stats(stats))
+        lines.extend(self._format_rtt_stats(stats))
+        lines.extend(self._format_lost_packets(stats))
+        lines.extend(self._format_failure_stats())
+        lines.append(_SUMMARY_SEPARATOR)
+        
         return "\n".join(lines)
 
 
