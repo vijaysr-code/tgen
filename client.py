@@ -448,6 +448,8 @@ def _format_debug_log(conn_id: int, message: str, **kwargs) -> str:
         details = " | ".join(f"{k}={v}" for k, v in kwargs.items())
         parts.append(f" | {details}")
     
+    return "".join(parts)
+
 
 def _calculate_backoff_delay(attempt: int) -> float:
     """
@@ -515,8 +517,6 @@ def _log_retry_attempt(error: Exception, conn_id: int, attempt: int,
             _log(f"[{timestamp}] [{conn_id:>6}] ✗ All {max_retries} attempts failed with RST")
         else:
             _log(f"[{timestamp}] [{conn_id:>6}] ✗ Connection reset on attempt {attempt + 1}/{max_retries}")
-
-    return "".join(parts)
 
 
 async def connect_with_retry(host: str, port: int, timeout: float,
