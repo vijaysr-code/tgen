@@ -13,6 +13,7 @@ import platform
 import resource
 import signal
 import socket
+import statistics
 import struct
 import sys
 import textwrap
@@ -425,6 +426,20 @@ class ServerStats:
             f"    {label} max       : {max(values):.2f}ms",
         ]
     
+    def _format_disconnect_reasons(self, disconnect_counts: Dict[str, int]) -> List[str]:
+        """Format disconnect reason statistics.
+        
+        Args:
+            disconnect_counts: Dictionary mapping disconnect reasons to counts
+            
+        Returns:
+            List of formatted disconnect reason lines
+        """
+        return [
+            f"    Disconnect {label:<10}: {disconnect_counts[key]}"
+            for label, key in _DISCONNECT_LABELS
+        ]
+    
     def _format_tcp_statistics(
         self,
         tcp_records: List[ConnectionRecord],
@@ -467,14 +482,9 @@ class ServerStats:
             if r.tcp_rtt_var_ms is not None:
                 rtt_var_vals.append(r.tcp_rtt_var_ms)
         
-        # Calculate averages for all TCP connections
-        tcp_all_count = len(tcp_all_records)
-        if tcp_all_count > 0:
-            tcp_avg_bytes = sum(r.bytes_received for r in tcp_all_records) / tcp_all_count
-            tcp_avg_msgs = sum(r.messages_received for r in tcp_all_records) / tcp_all_count
-        else:
-            tcp_avg_bytes = 0.0
-            tcp_avg_msgs = 0.0
+        # Calculate averages for all TCP connections using statistics.mean
+        tcp_avg_bytes = statistics.mean(r.bytes_received for r in tcp_all_records) if tcp_all_records else 0.0
+        tcp_avg_msgs = statistics.mean(r.messages_received for r in tcp_all_records) if tcp_all_records else 0.0
         
         # Disconnect reasons
         disconnect_counts = self._count_disconnect_reasons(tcp_all_records)
@@ -492,12 +502,7 @@ class ServerStats:
         
         lines.extend(self._format_rtt_stats("RTT", rtt_vals))
         lines.extend(self._format_rtt_stats("RTT var", rtt_var_vals))
-        
-        # Format disconnect reasons with consistent alignment
-        lines.extend([
-            f"    Disconnect {label:<10}: {disconnect_counts[key]}"
-            for label, key in _DISCONNECT_LABELS
-        ])
+        lines.extend(self._format_disconnect_reasons(disconnect_counts))
         
         return lines
     
